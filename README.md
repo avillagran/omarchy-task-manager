@@ -43,7 +43,16 @@ resume or close them.
   hyprland.lua). It drives `omarchy-shell shell toggle <full-plugin-id>`.
 - Paused apps get a grey translucent veil exactly over their window
   (persistent per-screen layer surface, click-through; panels opened later,
-  like X-Panel, render above it).
+  like X-Panel, render above it) with the vector Omarchy mascot on top —
+  official brand path + two animated eyes that blink (both eyes, then
+  staggered left/right, then a full eye-roll).
+- Hyprland's "Application Not Responding" dialog never fires for apps WE
+  froze: while anything is paused, misc:anr_missed_pings is raised at runtime
+  (hyprctl eval, no config files touched) and restored on the last thaw.
+- Subprocess control in the tree: every expanded thread row has pause and
+  kill buttons acting on that pid ONLY (signal-based, never the scope), so a
+  single hung browser tab/renderer can be stopped or closed (the tab shows
+  the browser's crash page) without touching the rest of the family.
 - Freeze = `systemctl --user freeze <app-scope>` (cgroup v2 freezer, no root,
   atomic, 0 CPU while frozen). RAM squeeze while frozen: `memory.high`
   lowered so the kernel reclaims cold pages; with zswap enabled they are

@@ -788,6 +788,37 @@ fn cmd_kill(pid: u64) {
     }
 }
 
+// ---------- single-thread (subprocess) control ----------
+// Browser tabs live in renderer pids INSIDE the app's systemd scope, so the
+// scope freezer cannot touch one thread alone: freeze the scope and the whole
+// browser pauses. Single-pid control therefore always uses signals + marker
+// files, exactly like the no-scope fallback, and never touches memory.high.
+
+/// Pause ONE subprocess (e.g. a hung browser tab/renderer).
+fn cmd_freeze_pid(pid: u64) {
+    if pid_stopped(pid) {
+        return;
+    }
+    sig(pid, "-STOP");
+    marker_add(pid);
+}
+
+/// Resume ONE subprocess paused with freeze-pid (or by anyone: CONT is a
+/// no-op for a running process).
+fn cmd_thaw_pid(pid: u64) {
+    sig(pid, "-CONT");
+    marker_remove(pid);
+}
+
+/// Close ONE subprocess: CONT first (a stopped process cannot die cleanly),
+/// then SIGTERM. Killing a renderer shows the browser's per-tab crash page,
+/// which is exactly what the user wants for a hung tab.
+fn cmd_kill_pid(pid: u64) {
+    sig(pid, "-CONT");
+    marker_remove(pid);
+    sig(pid, "-TERM");
+}
+
 // ---------- live history (written by `watch`, read by state/history) ----------
 fn history_path() -> String {
     let rt = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
@@ -1303,7 +1334,7 @@ fn cmd_zswap_copy() {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: task-manager <state|wins PID|freeze PID|thaw PID|focus PID|kill PID|procs PID|zswap-copy|pref K V|history|watch>"
+        "usage: task-manager <state|wins PID|freeze PID|thaw PID|focus PID|kill PID|freeze-pid PID|thaw-pid PID|kill-pid PID|procs PID|zswap-copy|pref K V|history|watch>"
     );
     std::process::exit(1)
 }
@@ -1319,6 +1350,9 @@ fn main() {
         "thaw" if args.len() == 3 => cmd_thaw(args[2].parse().unwrap_or_else(|_| usage())),
         "focus" if args.len() == 3 => cmd_focus(args[2].parse().unwrap_or_else(|_| usage())),
         "kill" if args.len() == 3 => cmd_kill(args[2].parse().unwrap_or_else(|_| usage())),
+        "freeze-pid" if args.len() == 3 => cmd_freeze_pid(args[2].parse().unwrap_or_else(|_| usage())),
+        "thaw-pid" if args.len() == 3 => cmd_thaw_pid(args[2].parse().unwrap_or_else(|_| usage())),
+        "kill-pid" if args.len() == 3 => cmd_kill_pid(args[2].parse().unwrap_or_else(|_| usage())),
         "zswap-copy" => cmd_zswap_copy(),
         "watch" => cmd_watch(),
         "history" => cmd_history(),

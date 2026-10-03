@@ -5,6 +5,7 @@
 // - Process tree per app, per-row sparklines, historical CPU/RAM graph.
 import QtQuick
 import QtQuick.Layouts
+import QtQuick.Shapes
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
@@ -16,6 +17,42 @@ BarWidget {
   moduleName: "io.github.avillagran.omarchy-task-manager"
 
   property var apps: []
+
+  // The row list renders from a ListModel reconciled in place: assigning a
+  // fresh array to a Repeater destroys and recreates every delegate on each
+  // poll (the visible "jumps"). set()/move() keep delegates alive — CPU%
+  // text and sparklines update without any re-layout flash.
+  ListModel { id: appsModel }
+
+  function reconcileApps(arr) {
+    var i, j, k
+    for (i = appsModel.count - 1; i >= 0; i--) {
+      var pid = appsModel.get(i).pid
+      var found = false
+      for (k = 0; k < arr.length; k++) if (arr[k].pid === pid) { found = true; break }
+      if (!found) appsModel.remove(i)
+    }
+    for (j = 0; j < arr.length; j++) {
+      var a = arr[j]
+      var idx = -1
+      for (i = 0; i < appsModel.count; i++) if (appsModel.get(i).pid === a.pid) { idx = i; break }
+      var roles = {
+        "pid": a.pid, "name": a.name, "title": a.title || "",
+        "rss_mb": a.rss_mb, "frozen": !!a.frozen, "procs": a.procs || 1,
+        "windows": a.windows || 0, "unit": a.unit || ""
+      }
+      if (idx === -1) appsModel.append(roles)
+      else appsModel.set(idx, roles)
+    }
+    // Order to match arr via move() (delegate reuse, no rebuild flash).
+    for (i = 0; i < arr.length && i < appsModel.count; i++) {
+      if (appsModel.get(i).pid !== arr[i].pid) {
+        for (j = i + 1; j < appsModel.count; j++) {
+          if (appsModel.get(j).pid === arr[i].pid) { appsModel.move(j, i, 1); break }
+        }
+      }
+    }
+  }
   property var frozenWins: []
   property var monitors: []
   property int frozenCount: 0
@@ -318,7 +355,8 @@ BarWidget {
         if (sb === "cpu") return cpuVal(b.unit, b.pid) - cpuVal(a.unit, a.pid)
         return b.rss_mb - a.rss_mb
       })
-      root.apps = arr
+      root.apps = arr          // logic/keyboard source (sorted)
+      root.reconcileApps(arr)  // view model: delegates update IN PLACE
       root.monitors = data.monitors || []
       var n = 0
       var fw = []
@@ -457,24 +495,31 @@ BarWidget {
       root.readKeybind()
       root.selIdx = (root.apps.length + root.background.length) ? 0 : -1
       Qt.callLater(function() { if (root.popupOpen) card.forceActiveFocus() })
+    } else {
+      root.cursorValid = false
     }
   }
 
   // --- keyboard navigation (Omarchy style: arrows + single-key actions) ----
   property int selIdx: -1
 
+  // Cursor in popup-window coordinates, for the mascot's subtle look-at.
+  // Fed by the popup's full-screen hover area and the card interceptor.
+  property real cursorX: 0
+  property real cursorY: 0
+  property bool cursorValid: false
+
   function ensureSelVisible() {
     if (root.selIdx < 0) return
-    var it = null, y = 0
     if (root.selIdx < root.apps.length) {
-      it = appsRep.itemAt(root.selIdx)
-      if (!it) return
-      y = it.y
-    } else {
-      it = bgRep.itemAt(root.selIdx - root.apps.length)
-      if (!it) return
-      y = bgRep.y + it.y
+      // ListView scrolls a delegate into view natively.
+      listFlick.positionViewAtIndex(root.selIdx, ListView.Contain)
+      return
     }
+    // Background rows live in the ListView footer: compute their offset.
+    var it = bgRep.itemAt(root.selIdx - root.apps.length)
+    if (!it || !listFlick.footerItem) return
+    var y = listFlick.footerItem.y + bgRep.y + it.y
     var h = it.height
     if (listFlick.contentY > y) listFlick.contentY = y
     else if (listFlick.contentY + listFlick.height < y + h)
@@ -577,6 +622,164 @@ BarWidget {
     kbRecheck.restart()
   }
 
+  // --- Omarchy mascot: official brand path (vector, ~500 bytes, no video --
+  // the plugin stays lightweight). Path data from
+  // https://omarchy.org/brand/omarchy-logo.svg (viewBox 0 0 1200 1200,
+  // evenodd). The brand logo has NO eyes; ours are two IDENTICAL rects,
+  // perfectly symmetric around the center (positions from the mascot raster).
+  component MascotFace: Item {
+    id: mascot
+    property color tint: "#9ece6a"
+    // Per-eye openness (1 = open, 0 = fully closed) for staggered blinks.
+    property real eyeOpenL: 1.0
+    property real eyeOpenR: 1.0
+    // Eye-roll orbit angle (degrees); 0 = eyes at rest.
+    property real rollAng: 0
+    implicitWidth: 64
+    implicitHeight: 64
+
+    // Eye geometry as fractions of the item, from the 1200-unit logo:
+    // eyes (400,450,73,161) and (715,450,73,161) -> SAME size, mirrored
+    // around x=0.5: centers 0.5 ± 0.13125.
+    readonly property real eyeW: 0.0608
+    readonly property real eyeTop: 0.375
+    readonly property real eyeH: 0.1342
+    readonly property real eyeLx: 0.3384   // 0.5 - 0.13125 - eyeW/2
+    readonly property real eyeRx: 0.6008   // 0.5 + 0.13125 - eyeW/2
+    readonly property real rollR: 0.022    // eye-roll orbit radius
+
+    // Subtle cursor pursuit: eyes lean toward the pointer (full lean at
+    // ~240px, capped at 3% of the mascot size). Both surfaces (popup and
+    // veils) cover the same screen with the same origin, so mapToItem(null)
+    // gives comparable coordinates in every window.
+    property point look: {
+      if (!root.cursorValid) return Qt.point(0, 0)
+      var c = mascot.mapToItem(null, mascot.width / 2, mascot.height / 2)
+      var dx = root.cursorX - c.x
+      var dy = root.cursorY - c.y
+      var d = Math.sqrt(dx * dx + dy * dy)
+      if (d < 1) return Qt.point(0, 0)
+      var f = Math.min(d / 240, 1) * 0.030
+      return Qt.point(dx / d * f, dy / d * f)
+    }
+
+    Shape {
+      x: 0
+      y: 0
+      width: 1200
+      height: 1200
+      transform: Scale {
+        xScale: mascot.width / 1200
+        yScale: mascot.height / 1200
+      }
+      ShapePath {
+        fillColor: mascot.tint
+        strokeColor: "transparent"
+        fillRule: ShapePath.OddEvenFill
+        PathSvg {
+          path: "m1200 1200h-480v-80h400v-1040h-479.996v160h-400v720h720v-720h-80v-80h159.996v880h-400v160h-640v-1200h1200zm-1120-80h480v-80h-400l.004-400h-80.004zm0-560h80.004v-400h400v-80h-480.004z"
+        }
+      }
+    }
+    Rectangle {
+      // Left eye. Blink squashes around its center down to a SLIT (never an
+      // empty transparent hole); roll orbits and the cursor look lean on top.
+      x: (mascot.eyeLx + Math.cos(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.x) * parent.width
+      width: mascot.eyeW * parent.width
+      y: (mascot.eyeTop + mascot.eyeH * (1 - mascot.eyeOpenL) / 2
+          + Math.sin(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.y) * parent.height
+      height: Math.max(1.2, mascot.eyeH * parent.height * mascot.eyeOpenL)
+      color: mascot.tint
+    }
+    Rectangle {
+      x: (mascot.eyeRx + Math.cos(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.x) * parent.width
+      width: mascot.eyeW * parent.width
+      y: (mascot.eyeTop + mascot.eyeH * (1 - mascot.eyeOpenR) / 2
+          + Math.sin(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.y) * parent.height
+      height: Math.max(1.2, mascot.eyeH * parent.height * mascot.eyeOpenR)
+      color: mascot.tint
+    }
+
+    // Humanized blink cycle: 1) both eyes, 2) left first with right lagging,
+    // 3) right first with left lagging, 4) eyes roll a full circle. Repeat.
+    property int blinkStep: 0
+    Timer {
+      id: blinkTimer
+      interval: 3000 + Math.random() * 4500
+      running: true
+      repeat: false
+      onTriggered: {
+        var s = mascot.blinkStep % 4
+        if (s === 0) { closeL.start(); closeR.start() }
+        else if (s === 1) { closeL.start(); delayR.start() }
+        else if (s === 2) { closeR.start(); delayL.start() }
+        else { rollAnim.start() }
+        mascot.blinkStep++
+        blinkTimer.interval = 3000 + Math.random() * 4500
+        blinkTimer.restart()
+      }
+    }
+    Timer { id: delayR; interval: 90; repeat: false; onTriggered: closeR.start() }
+    Timer { id: delayL; interval: 90; repeat: false; onTriggered: closeL.start() }
+    SequentialAnimation {
+      id: closeL
+      NumberAnimation { target: mascot; property: "eyeOpenL"; to: 0; duration: 110; easing.type: Easing.InQuad }
+      PauseAnimation { duration: 90 }
+      NumberAnimation { target: mascot; property: "eyeOpenL"; to: 1; duration: 150; easing.type: Easing.OutQuad }
+    }
+    SequentialAnimation {
+      id: closeR
+      NumberAnimation { target: mascot; property: "eyeOpenR"; to: 0; duration: 110; easing.type: Easing.InQuad }
+      PauseAnimation { duration: 90 }
+      NumberAnimation { target: mascot; property: "eyeOpenR"; to: 1; duration: 150; easing.type: Easing.OutQuad }
+    }
+    NumberAnimation {
+      id: rollAnim
+      target: mascot
+      property: "rollAng"
+      from: 0
+      to: 360
+      duration: 850
+      easing.type: Easing.InOutQuad
+      onStopped: mascot.rollAng = 0
+    }
+  }
+
+  // --- Hyprland "Application Not Responding" suppression -------------------
+  // Frozen apps cannot answer xdg-shell pings, so Hyprland pops its ANR
+  // dialog on windows WE paused. While any app is frozen, raise the ANR
+  // threshold at RUNTIME via `hyprctl eval hl.config(...)` — with lua configs
+  // `hyprctl keyword` is REFUSED ("can't work with non-legacy parsers"), and
+  // eval writes nothing to the user's files and dies with the compositor.
+  // The original value is restored the moment nothing is frozen anymore.
+  property int anrOriginal: -1
+  property bool anrSuppressed: false
+
+  Process {
+    id: anrProc
+    command: ["hyprctl", "getoption", "misc:anr_missed_pings", "-j"]
+    running: true
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var v = JSON.parse(text).int
+          if (v > 0) root.anrOriginal = v
+        } catch (e) {}
+      }
+    }
+  }
+
+  onFrozenCountChanged: {
+    if (root.frozenCount > 0 && !root.anrSuppressed && root.anrOriginal > 0) {
+      root.anrSuppressed = true
+      Quickshell.execDetached(["hyprctl", "eval", "hl.config({ misc = { anr_missed_pings = 99999 } })"])
+    } else if (root.frozenCount === 0 && root.anrSuppressed) {
+      root.anrSuppressed = false
+      Quickshell.execDetached(["hyprctl", "eval", "hl.config({ misc = { anr_missed_pings = " + root.anrOriginal + " } })"])
+    }
+  }
+
   // --- ONE persistent veil surface per screen, created at shell start. ---
   // Layer surfaces stack by creation order within a layer: because this
   // surface exists from boot, panels opened LATER (X-Panel, etc.) render
@@ -616,12 +819,10 @@ BarWidget {
           Column {
             anchors.centerIn: parent
             spacing: Style.space(4)
-            Text {
+            MascotFace {
+              width: 72
+              height: 72
               anchors.horizontalCenter: parent.horizontalCenter
-              text: "\uDB80\uDFE4"
-              color: "#ffffff"
-              font.family: root.iconFont
-              font.pixelSize: Style.font.title * 1.6
             }
             Text {
               anchors.horizontalCenter: parent.horizontalCenter
@@ -666,9 +867,16 @@ BarWidget {
 
     Region { id: cardInputRegion; item: card }
 
-    // Click outside the card closes the popup (unless pinned).
+    // Click outside the card closes the popup (unless pinned). Also feeds
+    // the cursor position so the mascots' eyes can follow it.
     MouseArea {
       anchors.fill: parent
+      hoverEnabled: true
+      onPositionChanged: function(mouse) {
+        root.cursorX = mouse.x
+        root.cursorY = mouse.y
+        root.cursorValid = true
+      }
       onClicked: if (!root.pinned) root.closePopup()
     }
 
@@ -687,8 +895,17 @@ BarWidget {
       Keys.onPressed: function(ev) { root.handleCardKey(ev) }
 
       // Interceptor: swallows clicks on card padding so the full-screen
-      // close area behind the card does not fire.
-      MouseArea { anchors.fill: parent }
+      // close area behind the card does not fire. Also feeds cursor tracking
+      // (hovering the card never reaches the full-screen area).
+      MouseArea {
+        anchors.fill: parent
+        hoverEnabled: true
+        onPositionChanged: function(mouse) {
+          root.cursorX = card.x + mouse.x
+          root.cursorY = card.y + mouse.y
+          root.cursorValid = true
+        }
+      }
 
       ColumnLayout {
         anchors.fill: parent
@@ -716,6 +933,12 @@ BarWidget {
                 color: Qt.darker(Color.popups.text, 1.8)
                 font.family: root.iconFont
                 font.pixelSize: Style.font.subtitle
+              }
+              // Brand mascot, blinking now and then.
+              MascotFace {
+                width: 20
+                height: 20
+                anchors.verticalCenter: parent.verticalCenter
               }
               Text {
                 id: hdrTitle
@@ -835,36 +1058,36 @@ BarWidget {
 
         // The list FLEXES: it absorbs leftover card space, so the Activity
         // section and footer pin to the bottom with no dead space.
-        Flickable {
+        // A ListView (not Flickable+Repeater): delegates update IN PLACE
+        // from the reconciled ListModel — no destroy/recreate flicker on
+        // each 2s poll — and it scrolls natively.
+        ListView {
           id: listFlick
           Layout.fillWidth: true
           Layout.fillHeight: true
-          contentWidth: width
-          contentHeight: listColumn.implicitHeight
           clip: true
+          spacing: Style.space(6)
+          model: appsModel
 
-          Column {
-            id: listColumn
-            width: parent.width
-            spacing: Style.space(6)
+          header: Text {
+            width: listFlick.width
+            visible: root.apps.length === 0
+            text: root.tr("noApps")
+            color: Qt.darker(Color.popups.text, 1.4)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+          }
 
-            Text {
-              visible: root.apps.length === 0
-              text: root.tr("noApps")
-              color: Qt.darker(Color.popups.text, 1.4)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.body
-            }
-
-            Repeater {
-              id: appsRep
-              model: root.apps
-              Column {
-                required property var modelData
-                required property int index
-                property var app: modelData
-                width: listColumn.width
-                spacing: 0
+          delegate: Column {
+            required property int index
+            // Quickshell's ListView does not inject ListModel roles into
+            // delegate context (neither bare names nor a per-item `model`
+            // object). Bind content to the reconciled data array instead —
+            // reconcileApps() keeps model order == root.apps order, and the
+            // binding re-evaluates on every poll without recreating rows.
+            property var app: (index < root.apps.length) ? root.apps[index] : ({})
+            width: listFlick.width
+            spacing: 0
 
                 Rectangle {
                   width: parent.width
@@ -979,7 +1202,10 @@ BarWidget {
                   }
                 }
 
-                // Expanded subprocess rows (tree view).
+                // Expanded subprocess rows (tree view). Each row carries
+                // pause + kill so a single hung thread (classic: a browser
+                // tab/renderer eating RAM) can be stopped without touching
+                // the rest of the family.
                 Repeater {
                   model: root.subRows(app.pid)
                   Rectangle {
@@ -988,7 +1214,10 @@ BarWidget {
                     width: parent.width - Style.space(20)
                     x: Style.space(20)
                     height: subRow.implicitHeight + Style.space(4)
-                    color: "transparent"
+                    color: proc.state === "T"
+                           ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.08)
+                           : "transparent"
+                    radius: Style.cornerRadius - 2
 
                     RowLayout {
                       id: subRow
@@ -1019,11 +1248,25 @@ BarWidget {
                         font.family: Style.font.family
                         font.pixelSize: Style.font.caption
                       }
+                      // Single-thread control: signals on this pid only —
+                      // the scope freezer would pause the WHOLE family.
+                      RowBtn {
+                        glyph: proc.state === "T" ? "\uDB81\uDC0A" : "\uDB80\uDFE4"
+                        accent: proc.state === "T"
+                        onClicked: root.action(proc.state === "T" ? "thaw-pid" : "freeze-pid", proc.pid)
+                      }
+                      RowBtn {
+                        glyph: "\uDB80\uDD56"
+                        danger: true
+                        onClicked: root.action("kill-pid", proc.pid)
+                      }
                     }
                   }
                 }
               }
-            }
+          footer: Column {
+            width: listFlick.width
+            spacing: Style.space(6)
 
             // --- background processes (no window), grouped by comm ---
             Text {
@@ -1042,7 +1285,7 @@ BarWidget {
                 required property var modelData
                 required property int index
                 property var bg: modelData
-                width: listColumn.width
+                width: listFlick.width
                 height: bgRow.implicitHeight + Style.space(8)
                 color: ((root.apps.length + index) === root.selIdx && !root.pinned)
                        ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18)
