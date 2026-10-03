@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.avillagran.omarchy-task-manager",
+  "name": "Task Manager",
+  "version": "0.1.0",
+  "author": "Andrés Villagrán <andres@villagranquiroz.cl>",
+  "license": "MIT",
+  "description": "Freeze/resume memory-hogging apps under memory pressure (POC).",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Task Manager",
+    "description": "Pause and resume apps to survive memory pressure.",
+    "category": "System",
+    "defaultSection": "right"
+  }
+}

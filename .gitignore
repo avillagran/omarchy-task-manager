@@ -1,0 +1,7 @@
+# Rust build artifacts
+bin/task-manager-rs/target/
+
+# OS / editor noise
+.DS_Store
+*.swp
+*~

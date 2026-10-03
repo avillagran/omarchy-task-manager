@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# Omarchy Task Manager — one-line installer.
+#
+#   curl -fsSL <raw-url>/install.sh | bash
+#   bash install.sh --local       # dev: symlink the current checkout
+#   bash install.sh --uninstall   # stop watchdog, thaw everything, remove unit
+#
+# Idempotent: safe to re-run. Never touches user data, never uses sudo.
+set -euo pipefail
+
+PLUGIN_ID="io.github.avillagran.omarchy-task-manager"
+GIT_URL="https://github.com/avillagran/omarchy-task-manager"
+UNIT_NAME="omarchy-task-manager.service"
+PLUGINS_DIR="$HOME/.config/omarchy/plugins"
+PLUGIN_DIR="$PLUGINS_DIR/$PLUGIN_ID"
+UNIT_DIR="$HOME/.config/systemd/user"
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+log() { printf 'task-manager: %s\n' "$*"; }
+
+plugin_dir() {
+  if [ -d "$PLUGIN_DIR" ]; then
+    (CDPATH= cd -- "$PLUGIN_DIR" && pwd -P)
+  else
+    return 1
+  fi
+}
+
+thaw_all() {
+  # Safety: never leave apps frozen after uninstall.
+  local dir launcher state pids pid
+  dir="$(plugin_dir 2>/dev/null)" || return 0
+  launcher="$dir/bin/task-manager-launch.sh"
+  [ -x "$launcher" ] || return 0
+  state="$("$launcher" state 2>/dev/null)" || return 0
+  pids="$(printf '%s' "$state" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+ids = [a["pid"] for a in d.get("apps", []) if a.get("frozen")]
+ids += [b["pid"] for b in d.get("background", []) if b.get("frozen")]
+print(" ".join(str(p) for p in ids))
+' 2>/dev/null || true)"
+  for pid in $pids; do
+    "$launcher" thaw "$pid" >/dev/null 2>&1 || true
+  done
+  [ -n "$pids" ] && log "thawed: $pids"
+  return 0
+}
+
+uninstall() {
+  log "uninstalling"
+  systemctl --user disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
+  thaw_all
+  rm -f "$UNIT_DIR/$UNIT_NAME"
+  systemctl --user daemon-reload
+  remove_keybind
+  omarchy plugin disable "$PLUGIN_ID" >/dev/null 2>&1 || true
+  # Remove only a dev symlink we manage; real installs stay for
+  # `omarchy plugin remove` (user's explicit call).
+  if [ -L "$PLUGIN_DIR" ]; then
+    rm -f "$PLUGIN_DIR"
+    log "removed dev symlink $PLUGIN_DIR"
+  fi
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  log "done. Plugin dir (if present) was left in place; remove it with:"
+  log "  omarchy plugin remove $PLUGIN_ID --yes"
+}
+
+install_unit() {
+  local dir="$1"
+  mkdir -p "$UNIT_DIR"
+  sed "s|@PLUGIN_DIR@|$dir|" "$dir/systemd/$UNIT_NAME" > "$UNIT_DIR/$UNIT_NAME"
+  systemctl --user daemon-reload
+  systemctl --user enable --now "$UNIT_NAME" >/dev/null
+  log "watchdog enabled ($UNIT_NAME)"
+}
+
+# SUPER+SHIFT+T is OPT-IN (marketplace rule: no user-config writes without
+# explicit consent). The card's keyboard toggle runs bin/task-manager-keybind.sh;
+# install.sh only REMOVES stale binds on uninstall.
+
+remove_keybind() {
+  local lua_dir="$HOME/.config/hypr"
+  local lua_file="$lua_dir/task-manager-bindings.lua"
+  local hl="$lua_dir/hyprland.lua"
+  rm -f "$lua_file"
+  if [ -f "$hl" ] && grep -qF 'require("hypr.task-manager-bindings")' "$hl"; then
+    local tmp
+    tmp="$(mktemp -p "$lua_dir" tm-hl.XXXXXX)"
+    grep -vF 'require("hypr.task-manager-bindings")' "$hl" > "$tmp" || true
+    mv -f "$tmp" "$hl"
+  fi
+  log "keybind removed"
+}
+
+main() {
+  case "${1:-}" in
+    --uninstall|uninstall) uninstall; exit 0 ;;
+    --local)
+      mkdir -p "$PLUGINS_DIR"
+      if [ -L "$PLUGIN_DIR" ] && [ "$(readlink -f "$PLUGIN_DIR")" = "$HERE" ]; then
+        log "dev symlink already in place"
+      else
+        ln -sfn "$HERE" "$PLUGIN_DIR"
+        log "symlinked $HERE -> $PLUGIN_DIR"
+      fi
+      ;;
+    "")
+      if [ -d "$PLUGIN_DIR" ]; then
+        log "plugin already present, reusing $PLUGIN_DIR"
+      else
+        omarchy plugin add "$GIT_URL" --enable --yes || {
+          [ -d "$PLUGIN_DIR" ] || { log "plugin add failed"; exit 1; }
+          log "plugin add returned nonzero but manifest exists; continuing"
+        }
+      fi
+      ;;
+    *) log "unknown option: $1 (use --local or --uninstall)"; exit 1 ;;
+  esac
+
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  omarchy plugin enable "$PLUGIN_ID" >/dev/null 2>&1 || true
+
+  dir="$(plugin_dir)" || { log "plugin dir not found after install"; exit 1; }
+  install_unit "$dir"
+  # The SUPER+SHIFT+T keybind is opt-in from the card (keyboard icon); if a
+  # previous version already enabled it, leave the user's bind untouched.
+  omarchy-restart-shell >/dev/null 2>&1 || true
+
+  # `bar put` against a shell that already holds the widget in its in-memory
+  # model is a no-op ("is on the bar" but shell.json never changes). Run it
+  # AFTER the restart, against the fresh model, with bounded retries, and
+  # verify the layout on disk; if the CLI still no-ops, edit shell.json.
+  shell_json="$HOME/.config/omarchy/shell.json"
+  for _ in 1 2 3 4 5; do
+    omarchy bar put "$PLUGIN_ID" --section right >/dev/null 2>&1 || true
+    if grep -q "$PLUGIN_ID" "$shell_json" 2>/dev/null; then
+      break
+    fi
+    sleep 2
+  done
+  if ! grep -q "$PLUGIN_ID" "$shell_json" 2>/dev/null; then
+    python3 - "$shell_json" "$PLUGIN_ID" <<'EOF' || true
+import json, sys
+p, pid = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(p))
+    right = d["bar"]["layout"]["right"]
+    if not any(i.get("id") == pid for i in right):
+        right.append({"id": pid})
+        json.dump(d, open(p, "w"), indent=2, ensure_ascii=False)
+except Exception:
+    pass
+EOF
+    omarchy-restart-shell >/dev/null 2>&1 || true
+  fi
+  log "installed. Click the tasks icon in the bar."
+}
+
+main "$@"

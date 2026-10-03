@@ -1,0 +1,13 @@
+[Unit]
+Description=Omarchy Task Manager memory-pressure watchdog
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@PLUGIN_DIR@/bin/task-manager-launch.sh watch
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
