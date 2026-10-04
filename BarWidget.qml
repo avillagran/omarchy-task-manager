@@ -514,6 +514,9 @@ BarWidget {
     if (root.popupOpen) {
       // Resolve the cursor's monitor fresh on every open.
       if (!cursorScreenProc.running) cursorScreenProc.running = true
+      // No ownership yet? Re-probe: a stale token (dead owner instance) is
+      // claimable now, so the popup can actually render.
+      if (!root.veilOwner && !veilClaim.running) veilClaim.running = true
       if (!root.cardPosSet) root.centerCard()
       root.refreshHistory()
       root.readKeybind()
@@ -822,13 +825,43 @@ BarWidget {
   // instances share $PPID, so a random token breaks the tie and the
   // write-then-reread closes the race.
   property bool veilOwner: false
+  property string veilToken: ""
+  // Claim ownership unless the recorded owner is provably alive: live pid AND
+  // a fresh heartbeat (owner rewrites its token every 5s). A dead instance
+  // under a live shell pid (QML hot-reload, plugin reload) leaves a stale
+  // token; the freshness check lets the next claimant take over instead of
+  // leaving popup+veils silently dead until the shell restarts.
   Process {
     id: veilClaim
     running: true
-    command: ["sh", "-c", "O=\"$XDG_RUNTIME_DIR/tm-veil-owner\"; R=$(head -c4 /dev/urandom | od -An -tx4 | tr -d ' '); P=$(cat \"$O\" 2>/dev/null); if [ -n \"$P\" ] && kill -0 \"${P%%:*}\" 2>/dev/null; then echo busy; else echo \"$PPID:$R\" > \"$O\"; sleep 0.2; [ \"$(cat \"$O\" 2>/dev/null)\" = \"$PPID:$R\" ] && echo owned || echo busy; fi"]
+    command: ["sh", "-c", "O=\"$XDG_RUNTIME_DIR/tm-veil-owner\"; R=$(head -c4 /dev/urandom | od -An -tx4 | tr -d ' '); P=$(cat \"$O\" 2>/dev/null); NOW=$(date +%s); MT=$(stat -c %Y \"$O\" 2>/dev/null || echo 0); if [ -n \"$P\" ] && kill -0 \"${P%%:*}\" 2>/dev/null && [ $(( NOW - MT )) -lt 12 ]; then echo busy; else echo \"$PPID:$R\" > \"$O\"; sleep 0.2; [ \"$(cat \"$O\" 2>/dev/null)\" = \"$PPID:$R\" ] && echo \"owned:$PPID:$R\" || echo busy; fi"]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.veilOwner = (text || "").trim() === "owned"
+      onStreamFinished: {
+        var t = (text || "").trim()
+        if (t.indexOf("owned:") === 0) {
+          root.veilToken = t.substring(6)
+          root.veilOwner = true
+        } else {
+          root.veilOwner = false
+        }
+      }
+    }
+  }
+  // Owner heartbeat: rewrite the token so other instances see a fresh owner.
+  // If the file no longer holds our token, another instance displaced us.
+  Timer {
+    interval: 5000
+    repeat: true
+    running: root.veilOwner && root.veilToken !== ""
+    onTriggered: if (!veilHeartbeat.running) veilHeartbeat.running = true
+  }
+  Process {
+    id: veilHeartbeat
+    command: ["sh", "-c", "O=\"$XDG_RUNTIME_DIR/tm-veil-owner\"; printf '%s' \"" + root.veilToken + "\" > \"$O\"; sleep 0.1; [ \"$(cat \"$O\" 2>/dev/null)\" = \"" + root.veilToken + "\" ] && echo ok || echo lost"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if ((text || "").trim() === "lost") root.veilOwner = false
     }
   }
 
