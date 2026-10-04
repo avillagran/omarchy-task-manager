@@ -667,6 +667,11 @@ BarWidget {
     property real eyeOpenR: 1.0
     // Eye-roll orbit angle (degrees); 0 = eyes at rest.
     property real rollAng: 0
+    // 0 = normal eyes, 1 = eyes morphed into the play triangle (veil hover).
+    property real playMorph: 0
+    Behavior on playMorph {
+      NumberAnimation { duration: 220; easing.type: Easing.InOutCubic }
+    }
     implicitWidth: 64
     implicitHeight: 64
 
@@ -716,20 +721,54 @@ BarWidget {
     Rectangle {
       // Left eye. Blink squashes around its center down to a SLIT (never an
       // empty transparent hole); roll orbits and the cursor look lean on top.
-      x: (mascot.eyeLx + Math.cos(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.x) * parent.width
-      width: mascot.eyeW * parent.width
+      // playMorph slides it toward the center and collapses it into the play
+      // triangle (right eye mirrors; the triangle grows in behind).
+      x: ((mascot.eyeLx + (0.462 - mascot.eyeLx) * mascot.playMorph)
+          + (1 - mascot.playMorph) * (Math.cos(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.x)) * parent.width
+      width: Math.max(0.8, mascot.eyeW * (1 - 0.85 * mascot.playMorph)) * parent.width
       y: (mascot.eyeTop + mascot.eyeH * (1 - mascot.eyeOpenL) / 2
           + Math.sin(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.y) * parent.height
       height: Math.max(1.2, mascot.eyeH * parent.height * mascot.eyeOpenL)
       color: mascot.tint
+      opacity: 1 - mascot.playMorph
     }
     Rectangle {
-      x: (mascot.eyeRx + Math.cos(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.x) * parent.width
-      width: mascot.eyeW * parent.width
+      x: ((mascot.eyeRx + (0.538 - mascot.eyeRx) * mascot.playMorph)
+          + (1 - mascot.playMorph) * (Math.cos(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.x)) * parent.width
+      width: Math.max(0.8, mascot.eyeW * (1 - 0.85 * mascot.playMorph)) * parent.width
       y: (mascot.eyeTop + mascot.eyeH * (1 - mascot.eyeOpenR) / 2
           + Math.sin(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.y) * parent.height
       height: Math.max(1.2, mascot.eyeH * parent.height * mascot.eyeOpenR)
       color: mascot.tint
+      opacity: 1 - mascot.playMorph
+    }
+    // Play triangle the eyes morph into: grows out of the eye line with a
+    // slight overshoot, centered on the eye midpoint (600,530 in logo units).
+    Shape {
+      x: 0
+      y: 0
+      width: 1200
+      height: 1200
+      opacity: mascot.playMorph
+      transform: [
+        Scale {
+          origin.x: 600
+          origin.y: 530
+          xScale: 0.25 + 0.75 * mascot.playMorph
+          yScale: 0.25 + 0.75 * mascot.playMorph
+        },
+        Scale {
+          xScale: mascot.width / 1200
+          yScale: mascot.height / 1200
+        }
+      ]
+      ShapePath {
+        fillColor: mascot.tint
+        strokeColor: "transparent"
+        PathSvg {
+          path: "M522,430 L722,530 L522,630 Z"
+        }
+      }
     }
 
     // Humanized blink cycle: 1) both eyes, 2) left first with right lagging,
@@ -891,75 +930,180 @@ BarWidget {
     }
   }
 
+  // --- Veils as REAL floating windows (compositor z-order, not a layer) ---
+  // One FloatingWindow per frozen window, floated at open by the config rule
+  // in hypr/task-manager-bindings.lua (title matching fails at open; rules
+  // via hyprctl eval never apply). The compositor stacks veils naturally:
+  // windows opened or raised later simply paint OVER the veil — no clipping
+  // shapes. A slow poll follows workspace/geometry (dispatchers work on
+  // existing windows) and re-tops the veil if the frozen window got raised
+  // above it (hide+show re-stacks on top).
+  property string veilRetop: ""
+
   Variants {
-    model: root.veilOwner ? Quickshell.screens : []
-    PanelWindow {
-      id: veilSurface
+    model: root.veilOwner ? root.frozenWins : []
+    delegate: FloatingWindow {
+      id: veilWin
       required property var modelData
-      property var scr: modelData
-      screen: scr
+      property var win: modelData
+      title: "tm-veil:" + win.addr
+      implicitWidth: Math.max(win.w, 1)
+      implicitHeight: Math.max(win.h, 1)
       visible: true
-      anchors { top: true; left: true; right: true; bottom: true }
-      color: "transparent"
-      exclusionMode: ExclusionMode.Ignore
-      mask: Region {}
-      WlrLayershell.namespace: "tm-overlay"
-      WlrLayershell.layer: WlrLayer.Top
-      WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
+      color: Qt.rgba(0.42, 0.44, 0.48, 0.55)
 
-      Repeater {
-        model: root.frozenWins
-        delegate: Rectangle {
-          required property var modelData
-          property var win: modelData
-          visible: win.mon === veilSurface.scr.name && root.winVisible(win)
-          x: win.x - (veilSurface.scr ? veilSurface.scr.x : 0)
-          y: win.y - (veilSurface.scr ? veilSurface.scr.y : 0)
-          width: Math.max(win.w, 1)
-          height: Math.max(win.h, 1)
-          color: Qt.rgba(0.42, 0.44, 0.48, 0.55)
-          radius: Style.cornerRadius
-          border.color: Qt.rgba(1, 1, 1, 0.28)
-          border.width: 1
+      // Born transparent; positioned ~90ms after map, then faded in. This
+      // kills the "centered for a second, then snaps" flash (the compositor
+      // places new floating windows at the center until the poll moves them).
+      property real showAlpha: 0
+      Timer {
+        id: veilPlace
+        interval: 90
+        onTriggered: {
+          var sel = "title:^tm-veil:" + win.addr + "$"
+          Quickshell.execDetached(["hyprctl", "dispatch",
+            "hl.dsp.window.move({ x = " + win.x + ", y = " + win.y + ", window = \"" + sel + "\" })"])
+          Quickshell.execDetached(["hyprctl", "dispatch",
+            "hl.dsp.window.resize({ window = \"" + sel + "\", x = " + win.w + ", y = " + win.h + " })"])
+          veilShow.restart()
+        }
+      }
+      Timer {
+        id: veilShow
+        interval: 80
+        onTriggered: veilWin.showAlpha = 1
+      }
+      Component.onCompleted: veilPlace.restart()
+      onVisibleChanged: if (visible) { veilWin.showAlpha = 0; veilPlace.restart() }
 
-          Column {
-            anchors.centerIn: parent
-            spacing: Style.space(4)
+      // Re-top: the frozen window was raised above us (user clicked through).
+      property string retop: root.veilRetop
+      onRetopChanged: {
+        if (retop.indexOf(win.addr + ":") === 0) {
+          veilWin.visible = false
+          Qt.callLater(function() { veilWin.visible = true })
+        }
+      }
+
+      Rectangle {
+        anchors.fill: parent
+        opacity: veilWin.showAlpha
+        color: "transparent"
+        border.color: Qt.rgba(1, 1, 1, 0.28)
+        border.width: 1
+        radius: Style.cornerRadius
+
+        // Clicks on the veil forward focus to the frozen window (it cannot
+        // respond anyway — frozen); the poll re-tops the veil afterwards.
+        MouseArea {
+          anchors.fill: parent
+          hoverEnabled: true
+          onPositionChanged: function(mouse) {
+            root.cursorX = win.x + mouse.x
+            root.cursorY = win.y + mouse.y
+            root.cursorValid = true
+          }
+          onClicked: Quickshell.execDetached(["hyprctl", "dispatch",
+            "hl.dsp.focus({ window = \"address:" + win.addr + "\" })"])
+        }
+
+        Column {
+          anchors.centerIn: parent
+          spacing: Style.space(4)
+          // Omi doubles as a RESUME button on hover: its eyes morph into the
+          // play triangle (animated both ways); clicking thaws straight from
+          // the veil.
+          Item {
+            width: 84
+            height: 84
+            anchors.horizontalCenter: parent.horizontalCenter
             MascotFace {
-              width: 72
-              height: 72
-              anchors.horizontalCenter: parent.horizontalCenter
+              anchors.fill: parent
+              playMorph: veilPlayArea.containsMouse ? 1 : 0
             }
-            // Order: Omi, APP NAME (3x, inverse block), PAUSED.
-            Rectangle {
-              anchors.horizontalCenter: parent.horizontalCenter
-              width: veilName.implicitWidth + Style.space(20)
-              height: veilName.implicitHeight + Style.space(10)
-              radius: Style.cornerRadius - 2
-              color: "#9ece6a"  // brand green: the veil's opposite
-              Text {
-                id: veilName
-                anchors.centerIn: parent
-                text: win.app
-                color: "#1a1b26"  // theme bg: inverse of the block
-                font.family: Style.font.family
-                font.pixelSize: Math.round(Style.font.caption * 3)
-                font.bold: true
-              }
+            MouseArea {
+              id: veilPlayArea
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: Quickshell.execDetached([root.binPath, "thaw", String(win.pid)])
             }
+          }
+          // Order: Omi, APP NAME (3x, inverse block), PAUSED.
+          Rectangle {
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: veilName.implicitWidth + Style.space(20)
+            height: veilName.implicitHeight + Style.space(10)
+            radius: Style.cornerRadius - 2
+            color: "#9ece6a"  // brand green: the veil's opposite
             Text {
-              anchors.horizontalCenter: parent.horizontalCenter
-              text: root.tr("pausedTag")
-              color: "#ffffff"
+              id: veilName
+              anchors.centerIn: parent
+              text: win.app
+              color: "#1a1b26"  // theme bg: inverse of the block
               font.family: Style.font.family
-              font.pixelSize: Style.font.body
+              font.pixelSize: Math.round(Style.font.caption * 3)
               font.bold: true
             }
+          }
+          Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: root.tr("pausedTag")
+            color: "#ffffff"
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+            font.bold: true
           }
         }
       }
     }
   }
+
+  // Follow the frozen window's geometry and re-top veils as needed.
+  Timer {
+    interval: 400
+    repeat: true
+    running: root.veilOwner && root.frozenCount > 0
+    onTriggered: {
+      for (var i = 0; i < root.frozenWins.length; i++) {
+        var w = root.frozenWins[i]
+        var sel = "title:^tm-veil:" + w.addr + "$"
+        if (!w.pinned)
+          Quickshell.execDetached(["hyprctl", "dispatch",
+            "hl.dsp.window.move({ workspace = \"" + w.ws + "\", follow = false, window = \"" + sel + "\" })"])
+        Quickshell.execDetached(["hyprctl", "dispatch",
+          "hl.dsp.window.move({ x = " + w.x + ", y = " + w.y + ", window = \"" + sel + "\" })"])
+        Quickshell.execDetached(["hyprctl", "dispatch",
+          "hl.dsp.window.resize({ window = \"" + sel + "\", x = " + w.w + ", y = " + w.h + " })"])
+      }
+      if (!veilActiveWinProc.running) veilActiveWinProc.running = true
+    }
+  }
+  Process {
+    id: veilActiveWinProc
+    command: ["hyprctl", "activewindow", "-j"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var a = JSON.parse(text)
+          var addr = a.address || ""
+          // Fire only on the TRANSITION into focusing a frozen window;
+          // re-firing while it stays focused flaps the veil every poll.
+          if (addr !== root.veilLastActive) {
+            root.veilLastActive = addr
+            for (var i = 0; i < root.frozenWins.length; i++) {
+              if (root.frozenWins[i].addr === addr) {
+                root.veilRetop = addr + ":" + Date.now()
+                break
+              }
+            }
+          }
+        } catch (e) {}
+      }
+    }
+  }
+  property string veilLastActive: ""
 
   // The popup must open where the user's ATTENTION is. Focus is wrong: after
   // moving a window across monitors the focus sits on the other screen and
