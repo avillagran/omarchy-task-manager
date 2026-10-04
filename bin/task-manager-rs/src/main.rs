@@ -113,7 +113,7 @@ struct Win {
 
 /// (name, active workspace id, x, y) per monitor, in hyprctl order
 /// (client.monitor is an index into this array).
-fn monitors() -> Vec<(String, i64, i64, i64)> {
+fn monitors() -> Vec<(String, i64, i64, i64, bool, i64, i64)> {
     let text = hyprctl(&["monitors", "-j"]);
     let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&text) else {
         return Vec::new();
@@ -128,12 +128,15 @@ fn monitors() -> Vec<(String, i64, i64, i64)> {
                 .unwrap_or(0);
             let x = m.get("x").and_then(Value::as_i64).unwrap_or(0);
             let y = m.get("y").and_then(Value::as_i64).unwrap_or(0);
-            Some((name, ws, x, y))
+            let focused = m.get("focused").and_then(Value::as_bool).unwrap_or(false);
+            let w = m.get("width").and_then(Value::as_i64).unwrap_or(0);
+            let h = m.get("height").and_then(Value::as_i64).unwrap_or(0);
+            Some((name, ws, x, y, focused, w, h))
         })
         .collect()
 }
 
-fn clients(mons: &[(String, i64, i64, i64)]) -> Vec<Win> {
+fn clients(mons: &[(String, i64, i64, i64, bool, i64, i64)]) -> Vec<Win> {
     let text = hyprctl(&["clients", "-j"]);
     let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&text) else {
         return Vec::new();
@@ -346,18 +349,39 @@ fn zswap_status() -> (bool, bool) {
     (true, enabled)
 }
 
-/// Pressure thresholds (env-overridable for testing).
+/// Read a numeric UI pref from prefs.json (written by `pref K V`).
+fn pref_num(key: &str, dflt: f64) -> f64 {
+    let cur = read_prefs();
+    let v: Value = serde_json::from_str(&cur).unwrap_or_else(|_| serde_json::json!({}));
+    v.get(key).and_then(|x| x.as_f64()).unwrap_or(dflt)
+}
+
+/// Pressure thresholds (prefs-backed; env still wins, for testing).
+/// The user configures the maximum USED RAM % they tolerate (watchMaxRam,
+/// default 94); the watchdog trips when FREE RAM falls below the remainder.
 fn crit_avail_pct() -> f64 {
-    env::var("TM_CRIT_AVAIL_PCT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(6.0)
+    if let Ok(v) = env::var("TM_CRIT_AVAIL_PCT") {
+        if let Ok(n) = v.parse() {
+            return n;
+        }
+    }
+    100.0 - pref_num("watchMaxRam", 94.0).clamp(50.0, 99.0)
 }
 fn crit_psi() -> f64 {
     env::var("TM_CRIT_PSI")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10.0)
+}
+/// CPU % above which the watchdog also freezes (0 = CPU trigger off).
+fn crit_cpu_pct() -> f64 {
+    if let Ok(v) = env::var("TM_CRIT_CPU_PCT") {
+        if let Ok(n) = v.parse() {
+            return n;
+        }
+    }
+    let n = pref_num("watchMaxCpu", 0.0);
+    if n <= 0.0 { 0.0 } else { n.clamp(50.0, 99.0) }
 }
 fn recover_avail_pct() -> f64 {
     env::var("TM_RECOVER_AVAIL_PCT")
@@ -588,6 +612,66 @@ fn windowed_set_contains(by_pid: &BTreeMap<u64, Vec<Win>>, pid: u64) -> bool {
     by_pid.contains_key(&pid)
 }
 
+/// System daemons: processes NOT owned by the session user, grouped by comm,
+/// sorted by RSS. Informational only — we cannot (and must not) signal
+/// foreign pids, so the UI renders no action buttons for these rows.
+fn collect_system(by_pid: &BTreeMap<u64, Vec<Win>>) -> Vec<BgRec> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = current_uid();
+    let self_pid = std::process::id() as u64;
+    let windowed_comms: Vec<String> = by_pid
+        .keys()
+        .map(|p| comm(*p))
+        .filter(|c| !EXCLUDE_COMMS.contains(&c.as_str()))
+        .collect();
+    let mut groups: BTreeMap<String, (u64, Vec<u64>)> = BTreeMap::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    for e in entries.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u64>().ok()) else {
+            continue;
+        };
+        if windowed_set_contains(by_pid, pid) || pid == self_pid {
+            continue;
+        }
+        let Ok(md) = fs::metadata(e.path()) else {
+            continue;
+        };
+        if md.uid() == uid {
+            continue; // ours: already listed under Apps/Background
+        }
+        let c = comm(pid);
+        if EXCLUDE_COMMS.contains(&c.as_str()) || windowed_comms.contains(&c) {
+            continue;
+        }
+        let r = rss_kb(pid);
+        if r == 0 {
+            continue; // kernel threads carry no RSS
+        }
+        let g = groups.entry(c).or_insert((0, Vec::new()));
+        g.0 += r;
+        g.1.push(pid);
+    }
+    let mut out: Vec<BgRec> = groups
+        .into_iter()
+        .map(|(name, (rkb, pids))| BgRec {
+            name,
+            rss_mb: rkb / 1024,
+            procs: pids.len(),
+            pid: pids.iter().copied().max().unwrap_or(0),
+            unit: String::new(),
+            mechanism: "signal",
+            frozen: false,
+        })
+        .collect();
+    out.sort_by(|a, b| b.rss_mb.cmp(&a.rss_mb));
+    // Keep it short: this section shares the scroll viewport with the app
+    // list — 6 top offenders usually fit without pushing it below the fold.
+    out.truncate(6);
+    out
+}
+
 fn cmd_state() {
     let mons = monitors();
     let mut by_pid: BTreeMap<u64, Vec<Win>> = BTreeMap::new();
@@ -677,11 +761,30 @@ fn cmd_state() {
     }
     bg_json.push(']');
 
+    // System daemons (not ours): same row shape, no actionable fields.
+    let system = collect_system(&by_pid);
+    let mut sys_json = String::from("\"system\":[");
+    let mut first = true;
+    for s in &system {
+        if !first {
+            sys_json.push(',');
+        }
+        first = false;
+        sys_json.push_str(&format!(
+            "{{\"pid\":{},\"name\":\"{}\",\"rss_mb\":{},\"procs\":{}}}",
+            s.pid,
+            json_escape(&s.name),
+            s.rss_mb,
+            s.procs
+        ));
+    }
+    sys_json.push(']');
+
     let mons_json: Vec<String> = mons
         .iter()
-        .map(|(name, ws, x, y)| {
+        .map(|(name, ws, x, y, focused, w, h)| {
             format!(
-                "{{\"name\":\"{}\",\"active_ws\":{ws},\"x\":{x},\"y\":{y}}}",
+                "{{\"name\":\"{}\",\"active_ws\":{ws},\"x\":{x},\"y\":{y},\"focused\":{focused},\"w\":{w},\"h\":{h}}}",
                 json_escape(name)
             )
         })
@@ -696,7 +799,7 @@ fn cmd_state() {
     };
     let prefs = read_prefs();
     println!(
-        "{{\"mem\":{{\"total_mb\":{total},\"avail_mb\":{avail},\"psi_some10\":{psi:.2},\"swap_total_mb\":{swap_total},\"swap_used_mb\":{swap_used}}},\"pressure\":{{\"avail_pct\":{avail_pct:.1},\"critical\":{critical}}},\"zswap\":{{\"available\":{zswap_avail},\"enabled\":{zswap_on}}},\"now\":{now_json},\"prefs\":{prefs},\"monitors\":[{}],{out},{bg_json}}}",
+        "{{\"mem\":{{\"total_mb\":{total},\"avail_mb\":{avail},\"psi_some10\":{psi:.2},\"swap_total_mb\":{swap_total},\"swap_used_mb\":{swap_used}}},\"pressure\":{{\"avail_pct\":{avail_pct:.1},\"critical\":{critical}}},\"zswap\":{{\"available\":{zswap_avail},\"enabled\":{zswap_on}}},\"now\":{now_json},\"prefs\":{prefs},\"monitors\":[{}],{out},{bg_json},{sys_json}}}",
         mons_json.join(",")
     );
 }
@@ -1059,6 +1162,8 @@ fn cmd_pref(key: &str, value: &str) {
         "cardW",
         "cardH",
         "sortBy",
+        "watchMaxRam",
+        "watchMaxCpu",
     ];
     if !allowed.contains(&key) {
         return;
@@ -1087,6 +1192,18 @@ fn cmd_pref(key: &str, value: &str) {
             return;
         }
         v[key] = serde_json::json!(value);
+    } else if key == "watchMaxRam" || key == "watchMaxCpu" {
+        // Watchdog thresholds (%): RAM used 50..=99; CPU 0 (off) or 50..=99.
+        let Ok(n) = value.parse::<u32>() else { return };
+        let ok = if key == "watchMaxRam" {
+            (50..=99).contains(&n)
+        } else {
+            n == 0 || (50..=99).contains(&n)
+        };
+        if !ok {
+            return;
+        }
+        v[key] = serde_json::json!(n);
     } else {
         v[key] = serde_json::json!(value == "1" || value == "true");
     }
@@ -1274,11 +1391,25 @@ fn cmd_watch() {
     let mut frozen_this_episode = 0u32;
     let mut hist = Hist::new();
     let mut prev_stat = cpu_times();
+    let mut prev_cpu = cpu_times();
     let mut prev_apps: BTreeMap<String, u64> = BTreeMap::new();
     let mut tick = 0u32;
     loop {
         let (total, avail, psi, _, _) = mem_info();
-        let (pct, crit) = pressure(total, avail, psi);
+        let (pct, mut crit) = pressure(total, avail, psi);
+        // CPU trigger (pref watchMaxCpu, 0 = off): freeze the biggest app
+        // when total CPU stays pegged — freezing stops the burn instantly.
+        let cpu_max = crit_cpu_pct();
+        let mut cpu_now = 0.0f32;
+        if cpu_max > 0.0 {
+            let st = cpu_times();
+            let dt = st.1.saturating_sub(prev_cpu.1).max(1);
+            cpu_now = st.0.saturating_sub(prev_cpu.0) as f32 * 100.0 / dt as f32;
+            prev_cpu = st;
+            if cpu_now >= cpu_max as f32 {
+                crit = true;
+            }
+        }
         if crit {
             hits += 1;
         } else {
@@ -1291,7 +1422,7 @@ fn cmd_watch() {
             match freeze_biggest() {
                 Some(what) => {
                     eprintln!(
-                        "watch: pressure critical ({pct:.1}% avail, psi {psi:.1}) — froze {what}"
+                        "watch: pressure critical ({pct:.1}% avail, psi {psi:.1}, cpu {cpu_now:.0}%/{cpu_max:.0}) — froze {what}"
                     );
                     frozen_this_episode += 1;
                     hits = 0;

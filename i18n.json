@@ -16,7 +16,17 @@
     "zswapPersist": "To persist across reboots: echo \"w /sys/module/zswap/parameters/enabled - - - - Y\" | sudo tee /etc/tmpfiles.d/zswap.conf",
     "copyCmd": "Copy command",
     "cores": "cores",
-    "keysHint": "↑↓ select · Enter focus · Space pause · X kill · → tree · G graphs · D cores · B bar · Esc close"
+    "keysHint": "↑↓ select · Enter focus · Space pause · X kill · → tree · G graphs · D cores · B bar · Esc close",
+    "prefsKeybind": "Show window shortcut",
+    "prefsOn": "On",
+    "prefsOff": "Off",
+    "prefsBarMode": "Bar display (icon / numbers / graph)",
+    "prefsSpark": "Row sparklines",
+    "prefsRam": "Auto-pause when RAM used ≥",
+    "prefsCpu": "Auto-pause when CPU ≥",
+    "prefsRefresh": "Refresh data now",
+    "prefsHint": "Beyond these limits the watchdog pauses the largest apps so the system stays responsive. CPU 'Off' disables that trigger.",
+    "system": "System"
   },
   "es": {
     "title": "Administrador de tareas",
@@ -35,7 +45,17 @@
     "zswapPersist": "Para que persista tras reinicios: echo \"w /sys/module/zswap/parameters/enabled - - - - Y\" | sudo tee /etc/tmpfiles.d/zswap.conf",
     "copyCmd": "Copiar comando",
     "cores": "núcleos",
-    "keysHint": "↑↓ elegir · Enter enfocar · Espacio pausa · X cerrar · → árbol · G gráficos · D núcleos · B barra · Esc salir"
+    "keysHint": "↑↓ elegir · Enter enfocar · Espacio pausa · X cerrar · → árbol · G gráficos · D núcleos · B barra · Esc salir",
+    "prefsKeybind": "Atajo para mostrar la ventana",
+    "prefsOn": "Activado",
+    "prefsOff": "Desactivado",
+    "prefsBarMode": "Indicador en barra (icono / números / gráfico)",
+    "prefsSpark": "Mini-gráficos por fila",
+    "prefsRam": "Pausar apps si RAM usada ≥",
+    "prefsCpu": "Pausar apps si CPU ≥",
+    "prefsRefresh": "Actualizar datos ahora",
+    "prefsHint": "Al superar estos límites, el vigilante pausa las apps más grandes para que el sistema siga respondiendo. CPU «Desactivado» apaga ese disparador.",
+    "system": "Sistema"
   },
   "pt": {
     "title": "Gerenciador de tarefas",
@@ -54,7 +74,17 @@
     "zswapPersist": "Para persistir após reiniciar: echo \"w /sys/module/zswap/parameters/enabled - - - - Y\" | sudo tee /etc/tmpfiles.d/zswap.conf",
     "copyCmd": "Copiar comando",
     "cores": "núcleos",
-    "keysHint": "↑↓ escolher · Enter focar · Espaço pausa · X fechar · → árvore · G gráficos · D núcleos · B barra · Esc sair"
+    "keysHint": "↑↓ escolher · Enter focar · Espaço pausa · X fechar · → árvore · G gráficos · D núcleos · B barra · Esc sair",
+    "prefsKeybind": "Atalho para mostrar a janela",
+    "prefsOn": "Ativado",
+    "prefsOff": "Desativado",
+    "prefsBarMode": "Indicador na barra (ícone / números / gráfico)",
+    "prefsSpark": "Mini-gráficos por linha",
+    "prefsRam": "Pausar apps se RAM usada ≥",
+    "prefsCpu": "Pausar apps se CPU ≥",
+    "prefsRefresh": "Atualizar dados agora",
+    "prefsHint": "Além destes limites, o vigilante pausa os maiores apps para manter o sistema responsivo. CPU «Desativado» desliga esse gatilho.",
+    "system": "Sistema"
   },
   "fr": {
     "title": "Gestionnaire des tâches",
@@ -73,7 +103,17 @@
     "zswapPersist": "Pour persister au redémarrage : echo \"w /sys/module/zswap/parameters/enabled - - - - Y\" | sudo tee /etc/tmpfiles.d/zswap.conf",
     "copyCmd": "Copier la commande",
     "cores": "cœurs",
-    "keysHint": "↑↓ choisir · Entrée focus · Espace pause · X fermer · → arbre · G graphes · D cœurs · B barre · Échap quitter"
+    "keysHint": "↑↓ choisir · Entrée focus · Espace pause · X fermer · → arbre · G graphes · D cœurs · B barre · Échap quitter",
+    "prefsKeybind": "Raccourci pour afficher la fenêtre",
+    "prefsOn": "Activé",
+    "prefsOff": "Désactivé",
+    "prefsBarMode": "Indicateur de barre (icône / chiffres / graphe)",
+    "prefsSpark": "Mini-graphiques par ligne",
+    "prefsRam": "Suspendre si RAM utilisée ≥",
+    "prefsCpu": "Suspendre si CPU ≥",
+    "prefsRefresh": "Actualiser les données",
+    "prefsHint": "Au-delà de ces limites, le gardien suspend les applis les plus lourdes pour garder le système fluide. CPU « Désactivé » coupe ce déclencheur.",
+    "system": "Système"
   },
   "de": {
     "title": "Task-Manager",
@@ -92,6 +132,16 @@
     "zswapPersist": "Für Persistenz nach Neustart: echo \"w /sys/module/zswap/parameters/enabled - - - - Y\" | sudo tee /etc/tmpfiles.d/zswap.conf",
     "copyCmd": "Befehl kopieren",
     "cores": "Kerne",
-    "keysHint": "↑↓ wählen · Enter Fokus · Leertaste Pause · X beenden · → Baum · G Grafik · D Kerne · B Leiste · Esc zu"
+    "keysHint": "↑↓ wählen · Enter Fokus · Leertaste Pause · X beenden · → Baum · G Grafik · D Kerne · B Leiste · Esc zu",
+    "prefsKeybind": "Tastenkürzel zum Einblenden",
+    "prefsOn": "An",
+    "prefsOff": "Aus",
+    "prefsBarMode": "Leistenanzeige (Symbol / Zahlen / Grafik)",
+    "prefsSpark": "Mini-Diagramme pro Zeile",
+    "prefsRam": "Apps pausieren bei RAM ≥",
+    "prefsCpu": "Apps pausieren bei CPU ≥",
+    "prefsRefresh": "Daten jetzt aktualisieren",
+    "prefsHint": "Über diesen Grenzen pausiert der Wächter die größten Apps, damit das System reaktionsfähig bleibt. CPU „Aus“ deaktiviert diesen Auslöser.",
+    "system": "System"
   }
 }

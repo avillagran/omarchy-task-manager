@@ -1,6 +1,6 @@
 # Omarchy Task Manager
 
-Freeze/resume memory-hogging apps from the Omarchy bar, Windows/macOS style:
+Freeze/resume memory-hogging apps from the Omarchy bar:
 when RAM runs out, apps pause, their windows go grey, and a dialog lets you
 resume or close them.
 
@@ -8,8 +8,11 @@ resume or close them.
 
 - Bar pill (tasks glyph) with red badge = number of paused apps; three modes
   cycled from the card: icon only (shrinks to natural bar size) / fixed-width
-  CPU+RAM percentages (chip + DIMM icons, no layout jitter) / percentages
+  CPU+RAM percentages (chip + cubes icons, no layout jitter) / percentages
   with separate CPU and RAM sparklines.
+- Gear button opens the preferences panel: show-window shortcut
+  (SUPER+SHIFT+T, opt-in), bar display mode, row sparklines, and the
+  watchdog's auto-pause thresholds (RAM used % and CPU %, CPU can be off).
 - Click -> draggable AND resizable overlay card (grip at bottom-right,
   geometry persisted) above ALL windows, on EVERY workspace. Pinned mode
   shrinks the input region to the card: clicks pass through to windows

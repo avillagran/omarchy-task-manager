@@ -7,6 +7,7 @@ import QtQuick
 import QtQuick.Layouts
 import QtQuick.Shapes
 import Quickshell
+import Quickshell.Hyprland
 import Quickshell.Io
 import Quickshell.Wayland
 import qs.Ui
@@ -17,6 +18,8 @@ BarWidget {
   moduleName: "io.github.avillagran.omarchy-task-manager"
 
   property var apps: []
+  // Foreign (system) daemons: informational section, no actions.
+  property var system: []
 
   // The row list renders from a ListModel reconciled in place: assigning a
   // fresh array to a Repeater destroys and recreates every delegate on each
@@ -66,7 +69,24 @@ BarWidget {
   property bool pressureCritical: false
   property real dismissedAt: 0
   property bool cardPosSet: false
+  property string cardPosScreen: ""
+  // Popup visibility is SHARED across instances through a runtime file.
+  // The shell preloads a ghost BarWidget instance and its IpcHandler/open()
+  // calls can land on the ghost (whose popup would be invisible); the file
+  // is the single source of truth and only the veil-owner renders the card.
   property bool popupOpen: false
+  readonly property string popupStatePath: Quickshell.env("XDG_RUNTIME_DIR") + "/tm-popup-open"
+  function writePopupState(opened) {
+    Quickshell.execDetached(["sh", "-c", "echo " + (opened ? "1" : "0") + " > \"" + root.popupStatePath + "\""])
+  }
+  FileView {
+    id: popupStateFile
+    path: root.popupStatePath
+    watchChanges: true
+    onFileChanged: this.reload()
+    onLoaded: root.popupOpen = (this.text() || "").trim() === "1"
+    onLoadFailed: root.popupOpen = false
+  }
   property bool pinned: false
   property var prefs: ({})
   property var hist: ({})
@@ -85,6 +105,9 @@ BarWidget {
   // as a cloud-upload glyph); both FiraCode NF and JetBrainsMono NF on this
   // system cover every glyph we use, but only when named explicitly.
   property string iconFont: "JetBrainsMono Nerd Font"
+  // Font Awesome glyphs (F0AE/F2DB/F1B3/F013/F161...) live in FiraCode NF,
+  // not JetBrainsMono — the bar pill icons use it directly, no fallback.
+  property string faFont: "FiraCode Nerd Font"
 
   // Bar pill display mode: "off" (icon only) / "numbers" / "numbers+graph".
   // Legacy boolean barStats maps to off/numbers.
@@ -202,7 +225,7 @@ BarWidget {
     var p = root.prefs
     p[k] = v
     root.prefs = Object.assign({}, p)  // reassign to trigger bindings
-    var s = (typeof v === "string") ? v : (v ? "1" : "0")
+    var s = (typeof v === "string") ? v : (typeof v === "number") ? String(v) : (v ? "1" : "0")
     Quickshell.execDetached([root.binPath, "pref", k, s])
   }
 
@@ -357,6 +380,7 @@ BarWidget {
       })
       root.apps = arr          // logic/keyboard source (sorted)
       root.reconcileApps(arr)  // view model: delegates update IN PLACE
+      root.system = data.system || []
       root.monitors = data.monitors || []
       var n = 0
       var fw = []
@@ -404,7 +428,7 @@ BarWidget {
       // something is frozen. Reopens after 60s if the user closed nothing.
       if (root.pressureCritical && root.frozenCount > 0
           && (Date.now() - root.dismissedAt) > 60000) {
-        root.popupOpen = true
+        root.writePopupState(true)
       }
     } catch (e) {
       root.apps = []
@@ -424,20 +448,8 @@ BarWidget {
   function action(verb, pid) {
     Quickshell.execDetached([root.binPath, verb, String(pid)])
     settleTimer.restart()
-    // Resume should BRING BACK the app: focus its window once it settles.
-    if (verb === "thaw") {
-      focusAfterThaw.pid = pid
-      focusAfterThaw.restart()
-    }
-  }
-
-  // Delayed focus so the compositor sees the thawed window first.
-  Timer {
-    id: focusAfterThaw
-    property int pid: 0
-    interval: 900
-    repeat: false
-    onTriggered: if (pid > 0) Quickshell.execDetached([root.binPath, "focus", String(pid)])
+    // Thaw does NOT steal focus: the user clicks the window (or the row's
+    // name) when THEY want it focused.
   }
 
   function resumeAll() {
@@ -458,6 +470,14 @@ BarWidget {
 
   function winVisible(win) {
     if (win.pinned) return true
+    // Live workspace tracking: Quickshell.Hyprland updates on the SAME
+    // ipc event as the compositor, so the veil sticks to its workspace
+    // instantly instead of waiting for the next state poll.
+    var ms = Hyprland.monitors.values
+    for (var i = 0; i < ms.length; i++) {
+      if (ms[i].name === win.mon)
+        return ms[i].activeWorkspace && ms[i].activeWorkspace.id === win.ws
+    }
     var m = monInfo(win.mon)
     if (!m) return true
     return win.ws === m.active_ws
@@ -469,7 +489,7 @@ BarWidget {
 
   function closePopup() {
     root.dismissedAt = Date.now()
-    root.popupOpen = false
+    root.writePopupState(false)
   }
 
   // The layer surface configures async: width/height are 0 on the first
@@ -489,8 +509,10 @@ BarWidget {
   }
 
   onPopupOpenChanged: {
-    if (root.popupOpen && !root.cardPosSet) root.centerCard()
     if (root.popupOpen) {
+      // Resolve the cursor's monitor fresh on every open.
+      if (!cursorScreenProc.running) cursorScreenProc.running = true
+      if (!root.cardPosSet) root.centerCard()
       root.refreshHistory()
       root.readKeybind()
       root.selIdx = (root.apps.length + root.background.length) ? 0 : -1
@@ -502,6 +524,8 @@ BarWidget {
 
   // --- keyboard navigation (Omarchy style: arrows + single-key actions) ----
   property int selIdx: -1
+  // Gear panel: shortcut, watchdog thresholds, display toggles.
+  property bool prefsOpen: false
 
   // Cursor in popup-window coordinates, for the mascot's subtle look-at.
   // Fed by the popup's full-screen hover area and the card interceptor.
@@ -516,18 +540,16 @@ BarWidget {
       listFlick.positionViewAtIndex(root.selIdx, ListView.Contain)
       return
     }
-    // Background rows live in the ListView footer: compute their offset.
-    var it = bgRep.itemAt(root.selIdx - root.apps.length)
-    if (!it || !listFlick.footerItem) return
-    var y = listFlick.footerItem.y + bgRep.y + it.y
-    var h = it.height
-    if (listFlick.contentY > y) listFlick.contentY = y
-    else if (listFlick.contentY + listFlick.height < y + h)
-      listFlick.contentY = y + h - listFlick.height
+    // Background rows live in the ListView footer (its delegate scope hides
+    // bgRep from here): scrolling to the end reveals them all.
+    listFlick.positionViewAtEnd()
   }
 
   function handleCardKey(ev) {
-    if (ev.key === Qt.Key_Escape) { root.closePopup(); ev.accepted = true; return }
+    if (ev.key === Qt.Key_Escape) {
+      if (root.prefsOpen) { root.prefsOpen = false } else { root.closePopup() }
+      ev.accepted = true; return
+    }
     if (ev.key === Qt.Key_R) { root.refresh(); ev.accepted = true; return }
     if (ev.key === Qt.Key_G) { root.setPref("showGraphs", !root.pref("showGraphs", true)); ev.accepted = true; return }
     if (ev.key === Qt.Key_D) { root.setPref("graphDetail", !root.pref("graphDetail", false)); ev.accepted = true; return }
@@ -580,18 +602,18 @@ BarWidget {
   // Shell panel-widget protocol: `omarchy-shell shell toggle <plugin-id>`
   // finds the live bar instance and drives it via open()/close()/opened.
   readonly property bool opened: root.popupOpen
-  function open() { root.popupOpen = true }
+  function open() { root.writePopupState(true) }
   function close() { root.closePopup() }
 
   // Global IPC: direct `qs ipc call omarchy.task-manager toggle` also works
   // (the keybind uses the shell dispatch above).
   IpcHandler {
     target: "omarchy.task-manager"
-    function open(): void { root.popupOpen = true }
-    function show(): void { root.popupOpen = true }
+    function open(): void { root.writePopupState(true) }
+    function show(): void { root.writePopupState(true) }
     function close(): void { root.closePopup() }
     function hide(): void { root.closePopup() }
-    function toggle(): void { if (root.popupOpen) root.closePopup(); else root.popupOpen = true }
+    function toggle(): void { root.writePopupState(!root.popupOpen) }
   }
 
   // --- SUPER+SHIFT+T keybind (OPT-IN; marketplace-safe) --------------------
@@ -785,8 +807,52 @@ BarWidget {
   // surface exists from boot, panels opened LATER (X-Panel, etc.) render
   // ABOVE it, while app windows (always below the Top layer) stay below.
   // mask: empty Region = click-through (the pill opens the manager).
+  // --- ONE persistent veil surface per screen, created at shell start. ---
+  // The shell preloads a second (ghost) BarWidget instance whose IpcHandler
+  // never wins; without a guard BOTH instances would paint identical veils
+  // (the visible "double layer" = doubled alpha). Claim ownership with a
+  // pid-liveness lock; only the winner renders veils. Same-process
+  // instances share $PPID, so a random token breaks the tie and the
+  // write-then-reread closes the race.
+  property bool veilOwner: false
+  Process {
+    id: veilClaim
+    running: true
+    command: ["sh", "-c", "O=\"$XDG_RUNTIME_DIR/tm-veil-owner\"; R=$(head -c4 /dev/urandom | od -An -tx4 | tr -d ' '); P=$(cat \"$O\" 2>/dev/null); if [ -n \"$P\" ] && kill -0 \"${P%%:*}\" 2>/dev/null; then echo busy; else echo \"$PPID:$R\" > \"$O\"; sleep 0.2; [ \"$(cat \"$O\" 2>/dev/null)\" = \"$PPID:$R\" ] && echo owned || echo busy; fi"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.veilOwner = (text || "").trim() === "owned"
+    }
+  }
+
+  // Cursor position for the veil mascots while the popup is closed (veils
+  // are click-through, so no hover reaches them): poll hyprctl cursorpos.
+  // Cheap (120ms) and only while something is actually frozen.
+  Timer {
+    id: cursorPoll
+    interval: 120
+    repeat: true
+    running: root.frozenCount > 0 && !root.popupOpen
+    onTriggered: if (!cursorPosProc.running) cursorPosProc.running = true
+  }
+  Process {
+    id: cursorPosProc
+    command: ["hyprctl", "cursorpos"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var m = /(-?\d+)[, ]+\s*(-?\d+)/.exec(text || "")
+        if (m) {
+          root.cursorX = parseInt(m[1])
+          root.cursorY = parseInt(m[2])
+          root.cursorValid = true
+        }
+      }
+    }
+  }
+
   Variants {
-    model: Quickshell.screens
+    model: root.veilOwner ? Quickshell.screens : []
     PanelWindow {
       id: veilSurface
       required property var modelData
@@ -824,6 +890,23 @@ BarWidget {
               height: 72
               anchors.horizontalCenter: parent.horizontalCenter
             }
+            // Order: Omi, APP NAME (3x, inverse block), PAUSED.
+            Rectangle {
+              anchors.horizontalCenter: parent.horizontalCenter
+              width: veilName.implicitWidth + Style.space(20)
+              height: veilName.implicitHeight + Style.space(10)
+              radius: Style.cornerRadius - 2
+              color: "#9ece6a"  // brand green: the veil's opposite
+              Text {
+                id: veilName
+                anchors.centerIn: parent
+                text: win.app
+                color: "#1a1b26"  // theme bg: inverse of the block
+                font.family: Style.font.family
+                font.pixelSize: Math.round(Style.font.caption * 3)
+                font.bold: true
+              }
+            }
             Text {
               anchors.horizontalCenter: parent.horizontalCenter
               text: root.tr("pausedTag")
@@ -832,24 +915,63 @@ BarWidget {
               font.pixelSize: Style.font.body
               font.bold: true
             }
-            Text {
-              anchors.horizontalCenter: parent.horizontalCenter
-              text: win.app
-              color: Qt.rgba(1, 1, 1, 0.75)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-            }
           }
         }
       }
     }
   }
 
+  // The popup must open where the user's ATTENTION is. Focus is wrong: after
+  // moving a window across monitors the focus sits on the other screen and
+  // the card "disappears" there. The cursor's monitor is the right answer
+  // for both the bar click and SUPER+SHIFT+T — resolved fresh at open time.
+  property var popupScreen: null
+  Process {
+    id: cursorScreenProc
+    command: ["hyprctl", "cursorpos"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var m = /(-?\d+)[, ]+\s*(-?\d+)/.exec(text || "")
+        if (!m) return
+        var cx = parseInt(m[1]), cy = parseInt(m[2])
+        for (var i = 0; i < root.monitors.length; i++) {
+          var mon = root.monitors[i]
+          if (cx >= mon.x && cx < mon.x + mon.w && cy >= mon.y && cy < mon.y + mon.h) {
+            for (var j = 0; j < Quickshell.screens.length; j++) {
+              if (Quickshell.screens[j].name === mon.name) {
+                root.popupScreen = Quickshell.screens[j]
+                // Card position is relative to the popup window: a position
+                // dragged on one monitor is off-center (or off-screen) on
+                // another — re-center when the target screen changes.
+                if (root.cardPosScreen !== mon.name) {
+                  root.cardPosScreen = mon.name
+                  root.cardPosSet = false
+                  Qt.callLater(function() { if (!root.cardPosSet) root.centerCard() })
+                }
+                return
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  function focusedScreen() {
+    for (var i = 0; i < root.monitors.length; i++) {
+      if (!root.monitors[i].focused) continue
+      for (var j = 0; j < Quickshell.screens.length; j++)
+        if (Quickshell.screens[j].name === root.monitors[i].name)
+          return Quickshell.screens[j]
+    }
+    return Quickshell.screens.length > 0 ? Quickshell.screens[0] : null
+  }
+
   // --- popup: Overlay layer, above everything, visible on all workspaces ---
   PanelWindow {
     id: popupWin
-    visible: root.popupOpen
-    screen: Quickshell.screens.length > 0 ? Quickshell.screens[0] : null
+    visible: root.popupOpen && root.veilOwner
+    screen: root.popupScreen ? root.popupScreen : root.focusedScreen()
     anchors { top: true; left: true; right: true; bottom: true }
     color: "transparent"
     exclusionMode: ExclusionMode.Ignore
@@ -950,39 +1072,26 @@ BarWidget {
               }
             }
           }
-          // Pin: keep the dialog visible (outside clicks don't close it).
-          IconBtn {
-            glyph: "\uF08D"
-            active: root.pinned
-            onClicked: root.pinned = !root.pinned
-          }
-          // Eye: cycle the bar pill display — icon only → numbers →
-          // numbers + mini CPU graph → icon only.
-          IconBtn {
-            glyph: root.barMode === "graph" ? "\uF201"
-                 : (root.barMode === "off" ? "\uDB81\uDED1" : "\uDB81\uDED0")
-            active: root.barMode !== "off"
-            onClicked: root.cycleBarMode()
-          }
-          // Chart: per-row sparklines (bar chart icon).
-          IconBtn {
-            glyph: "\uF080"
-            active: root.pref("sparklines", false)
-            onClicked: root.setPref("sparklines", !root.pref("sparklines", false))
-          }
           // Sort: cycle RAM → CPU → name (bars + arrow reads as "sort").
           IconBtn {
             glyph: "\uF161"
             active: root.sortBy !== "ram"
             onClicked: root.cycleSort()
           }
-          IconBtn { glyph: "\uDB81\uDC53"; active: false; onClicked: root.refresh() }
-          // Keyboard: OPT-IN SUPER+SHIFT+T bind — writes the hyprland lua
-          // only on this explicit click (marketplace rule: consent required).
+          // Pin: keep the dialog visible (outside clicks don't close it).
           IconBtn {
-            glyph: "\uDB80\uDF0C"
-            active: root.keybindOn
-            onClicked: root.toggleKeybind()
+            glyph: "\uF08D"
+            active: root.pinned
+            onClicked: root.pinned = !root.pinned
+          }
+          // Gear: preferences panel (shortcut, thresholds, display toggles).
+          IconBtn {
+            glyph: "\uF013"
+            active: root.prefsOpen
+            onClicked: {
+              root.prefsOpen = !root.prefsOpen
+              if (root.prefsOpen) root.readKeybind()
+            }
           }
           IconBtn { glyph: "\uDB80\uDD56"; active: false; onClicked: root.closePopup() }
         }
@@ -1056,6 +1165,159 @@ BarWidget {
           }
         }
 
+        // --- preferences panel (gear): everything configurable lives here --
+        // Replaces the process list while open; Esc backs out to the list.
+        // fillHeight keeps the rows TOP-aligned (without a flexing item the
+        // layout centered them vertically).
+        Column {
+          visible: root.prefsOpen
+          Layout.fillWidth: true
+          Layout.fillHeight: true
+          spacing: Style.space(8)
+
+          // Shortcut: OPT-IN SUPER+SHIFT+T bind — the helper script writes
+          // the hyprland lua only on this explicit click (marketplace rule:
+          // consent required).
+          RowLayout {
+            width: parent.width
+            spacing: Style.space(8)
+            Text {
+              Layout.fillWidth: true
+              text: root.tr("prefsKeybind")
+              color: Color.popups.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+            Text {
+              text: "SUPER+SHIFT+T"
+              color: root.keybindOn ? Color.accent : Qt.darker(Color.popups.text, 1.5)
+              font.family: root.iconFont
+              font.pixelSize: Style.font.caption
+            }
+            Button {
+              iconText: root.keybindOn ? root.tr("prefsOn") : root.tr("prefsOff")
+              bordered: true
+              onClicked: root.toggleKeybind()
+            }
+          }
+
+          // Bar pill display mode (icon only / numbers / numbers+graph).
+          RowLayout {
+            width: parent.width
+            spacing: Style.space(8)
+            Text {
+              Layout.fillWidth: true
+              text: root.tr("prefsBarMode")
+              color: Color.popups.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+            Button {
+              iconText: root.barMode
+              bordered: true
+              onClicked: root.cycleBarMode()
+            }
+          }
+
+          // Per-row sparklines.
+          RowLayout {
+            width: parent.width
+            spacing: Style.space(8)
+            Text {
+              Layout.fillWidth: true
+              text: root.tr("prefsSpark")
+              color: Color.popups.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+            Button {
+              iconText: root.pref("sparklines", false) ? root.tr("prefsOn") : root.tr("prefsOff")
+              bordered: true
+              onClicked: root.setPref("sparklines", !root.pref("sparklines", false))
+            }
+          }
+
+          // Watchdog: auto-pause the biggest apps when RAM used >= this.
+          RowLayout {
+            width: parent.width
+            spacing: Style.space(8)
+            property int v: root.pref("watchMaxRam", 94)
+            Text {
+              Layout.fillWidth: true
+              text: root.tr("prefsRam")
+              color: Color.popups.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+            Button {
+              iconText: "−"
+              bordered: true
+              onClicked: if (parent.v > 50) root.setPref("watchMaxRam", parent.v - 1)
+            }
+            Text {
+              text: parent.v + "%"
+              color: Color.accent
+              font.family: root.iconFont
+              font.pixelSize: Style.font.caption
+            }
+            Button {
+              iconText: "+"
+              bordered: true
+              onClicked: if (parent.v < 99) root.setPref("watchMaxRam", parent.v + 1)
+            }
+          }
+
+          // Watchdog: CPU trigger (Off = disabled; freezes stop CPU burn).
+          RowLayout {
+            width: parent.width
+            spacing: Style.space(8)
+            property int v: root.pref("watchMaxCpu", 0)
+            Text {
+              Layout.fillWidth: true
+              text: root.tr("prefsCpu")
+              color: Color.popups.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+            Button {
+              iconText: "−"
+              bordered: true
+              onClicked: if (parent.v > 0) root.setPref("watchMaxCpu", parent.v <= 55 ? 0 : parent.v - 5)
+            }
+            Text {
+              text: parent.v === 0 ? root.tr("prefsOff") : parent.v + "%"
+              color: Color.accent
+              font.family: root.iconFont
+              font.pixelSize: Style.font.caption
+            }
+            Button {
+              iconText: "+"
+              bordered: true
+              onClicked: if (parent.v < 99) root.setPref("watchMaxCpu", parent.v === 0 ? 50 : parent.v + 5)
+            }
+          }
+
+          RowLayout {
+            width: parent.width
+            spacing: Style.space(8)
+            Button {
+              iconText: root.tr("prefsRefresh")
+              bordered: true
+              onClicked: root.refresh()
+            }
+            Item { Layout.fillWidth: true; height: 1 }
+          }
+
+          Text {
+            width: parent.width
+            text: root.tr("prefsHint")
+            color: Qt.darker(Color.popups.text, 1.5)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption - 1
+            wrapMode: Text.WrapAnywhere
+          }
+        }
+
         // The list FLEXES: it absorbs leftover card space, so the Activity
         // section and footer pin to the bottom with no dead space.
         // A ListView (not Flickable+Repeater): delegates update IN PLACE
@@ -1063,6 +1325,7 @@ BarWidget {
         // each 2s poll — and it scrolls natively.
         ListView {
           id: listFlick
+          visible: !root.prefsOpen
           Layout.fillWidth: true
           Layout.fillHeight: true
           clip: true
@@ -1334,6 +1597,55 @@ BarWidget {
                 }
               }
             }
+
+            // --- system daemons (not ours): what eats resources when the
+            // machine feels slow. Informational only — we cannot signal
+            // foreign pids, so these rows carry no buttons. ---
+            Text {
+              visible: root.system.length > 0
+              text: root.tr("system")
+              color: Qt.darker(Color.popups.text, 1.4)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+
+            Repeater {
+              id: sysRep
+              model: root.system
+              Rectangle {
+                required property var modelData
+                property var sys: modelData
+                width: listFlick.width
+                height: sysRow.implicitHeight + Style.space(8)
+                color: "transparent"
+                radius: Style.cornerRadius - 2
+
+                RowLayout {
+                  id: sysRow
+                  width: parent.width - Style.space(16)
+                  anchors.centerIn: parent
+                  spacing: Style.space(8)
+
+                  Item { width: 14; height: 1 }
+                  Text {
+                    Layout.fillWidth: true
+                    text: sys.name
+                    color: Qt.darker(Color.popups.text, 1.6)
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
+                  Text {
+                    text: (sys.procs > 1 ? sys.procs + " " + root.tr("procs") + " · " : "")
+                          + sys.rss_mb + " MB"
+                    color: Qt.darker(Color.popups.text, 1.6)
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
+            }
           }
         }
 
@@ -1342,7 +1654,7 @@ BarWidget {
           id: activitySection
           Layout.fillWidth: true
           spacing: Style.space(4)
-          visible: root.pref("showGraphs", true)
+          visible: root.pref("showGraphs", true) && !root.prefsOpen
 
           RowLayout {
             width: parent.width
@@ -1571,7 +1883,7 @@ BarWidget {
       Text {
         text: "\uF0AE"
         color: root.frozenCount > 0 ? Color.accent : Color.foreground
-        font.family: root.iconFont
+        font.family: root.faFont
         font.pixelSize: Style.font.body
         anchors.verticalCenter: parent.verticalCenter
       }
@@ -1580,7 +1892,7 @@ BarWidget {
         visible: root.barMode !== "off"
         text: "\uF2DB " + ("   " + root.cpuNow.toFixed(0)).slice(-3) + "%"
         color: Qt.darker(Color.foreground, 1.3)
-        font.family: root.iconFont
+        font.family: root.faFont
         font.pixelSize: Style.font.caption
         anchors.verticalCenter: parent.verticalCenter
       }
@@ -1614,12 +1926,12 @@ BarWidget {
           ctx.stroke()
         }
       }
-      // RAM: DIMM stick + fixed-width % + its OWN sparkline (graph mode).
+      // RAM: cubes (blocks) + fixed-width % + its OWN sparkline (graph mode).
       Text {
         visible: root.barMode !== "off"
-        text: "\uDB81\uDD38 " + ("   " + root.memNow.toFixed(0)).slice(-3) + "%"
+        text: "\uF1B3 " + ("   " + root.memNow.toFixed(0)).slice(-3) + "%"
         color: Qt.darker(Color.foreground, 1.3)
-        font.family: root.iconFont
+        font.family: root.faFont
         font.pixelSize: Style.font.caption
         anchors.verticalCenter: parent.verticalCenter
       }
@@ -1677,8 +1989,8 @@ BarWidget {
     hoverEnabled: true
     onClicked: function(mouse) {
       if (mouse.button === Qt.LeftButton) {
-        root.popupOpen = !root.popupOpen
-        if (root.popupOpen) root.refresh()
+        root.writePopupState(!root.popupOpen)
+        if (!root.popupOpen) root.refresh()
       }
     }
   }
