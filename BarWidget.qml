@@ -551,6 +551,11 @@ BarWidget {
       ev.accepted = true; return
     }
     if (ev.key === Qt.Key_R) { root.refresh(); ev.accepted = true; return }
+    if (ev.key === Qt.Key_O) {
+      root.prefsOpen = !root.prefsOpen
+      if (root.prefsOpen) root.readKeybind()
+      ev.accepted = true; return
+    }
     if (ev.key === Qt.Key_G) { root.setPref("showGraphs", !root.pref("showGraphs", true)); ev.accepted = true; return }
     if (ev.key === Qt.Key_D) { root.setPref("graphDetail", !root.pref("graphDetail", false)); ev.accepted = true; return }
     if (ev.key === Qt.Key_B) { root.cycleBarMode(); ev.accepted = true; return }

@@ -92,6 +92,12 @@ button.
 - Helper: ~5 ms per state call, ~500 KB binary. Watchdog: 2 reads/500 ms.
 - Bar poll: 15 s idle, 2 s while the card is open or any app is paused.
 
+## Credits
+
+- **Omi**, the mascot blinking over your paused apps, was an idea by
+  [@tahayvr](https://github.com/tahayvr). The vector path comes from the
+  official Omarchy brand assets.
+
 ## Roadmap
 
 - x86_64 prebuilt binary (build on an x86_64 Omarchy box).
