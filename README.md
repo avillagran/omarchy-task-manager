@@ -85,6 +85,7 @@ button.
     bin/task-manager-launch.sh     arch launcher
     bin/task-manager-keybind.sh    opt-in shortcut manager
     bin/task-manager-aarch64       prebuilt helper (ARM/Asahi)
+    bin/task-manager-x86_64        prebuilt helper (Intel/AMD)
     bin/task-manager-rs/           Rust crate (cargo build --release)
 
 ## Resource cost (measured)
@@ -100,5 +101,4 @@ button.
 
 ## Roadmap
 
-- x86_64 prebuilt binary (build on an x86_64 Omarchy box).
 - Marketplace submission.
