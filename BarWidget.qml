@@ -65,6 +65,7 @@ BarWidget {
   property int swapUsedMb: 0
   property bool zswapAvailable: true
   property bool zswapEnabled: true
+  property bool zramBacked: false
   property var background: []
   property bool pressureCritical: false
   property real dismissedAt: 0
@@ -410,6 +411,7 @@ BarWidget {
       if (data.zswap) {
         root.zswapAvailable = !!data.zswap.available
         root.zswapEnabled = !!data.zswap.enabled
+        root.zramBacked = !!data.zswap.zram
       }
       if (data.pressure) root.pressureCritical = !!data.pressure.critical
       root.background = data.background || []
@@ -1119,9 +1121,11 @@ BarWidget {
         }
 
         // zswap warning banner: compression off = squeezed RAM goes to disk.
+        // Not shown when swap is zram-backed (Omarchy stock): RAM compression
+        // already happens there by design.
         Rectangle {
           id: zswapBanner
-          visible: !root.zswapEnabled
+          visible: !root.zswapEnabled && !root.zramBacked
           Layout.fillWidth: true
           height: bannerCol.implicitHeight + Style.space(16)
           color: Qt.rgba(0.95, 0.65, 0.15, 0.12)

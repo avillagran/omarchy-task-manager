@@ -339,14 +339,19 @@ fn sig(pid: u64, sig: &str) {
     let _ = Command::new("kill").args([sig, &pid.to_string()]).output();
 }
 
-fn zswap_status() -> (bool, bool) {
-    // (kernel supports it, currently enabled)
+fn zswap_status() -> (bool, bool, bool) {
+    // (kernel supports it, currently enabled, swap already zram-backed)
+    // Omarchy stock ships swap-on-zram with zswap deliberately OFF: zram
+    // already compresses in RAM, so the enable-zswap banner must not nag.
     let p = "/sys/module/zswap/parameters/enabled";
+    let zram = read_trim("/proc/swaps")
+        .map(|s| s.lines().skip(1).any(|l| l.contains("zram")))
+        .unwrap_or(false);
     if !Path::new(p).exists() {
-        return (false, false);
+        return (false, false, zram);
     }
     let enabled = read_trim(p).as_deref() == Some("Y");
-    (true, enabled)
+    (true, enabled, zram)
 }
 
 /// Read a numeric UI pref from prefs.json (written by `pref K V`).
@@ -791,7 +796,7 @@ fn cmd_state() {
         .collect();
 
     let (total, avail, psi, swap_total, swap_used) = mem_info();
-    let (zswap_avail, zswap_on) = zswap_status();
+    let (zswap_avail, zswap_on, zram_backed) = zswap_status();
     let (avail_pct, critical) = pressure(total, avail, psi);
     let now_json = match now_from_history() {
         Some((c, m)) => format!("{{\"cpu\":{c:.1},\"mem\":{m:.1}}}"),
@@ -799,7 +804,7 @@ fn cmd_state() {
     };
     let prefs = read_prefs();
     println!(
-        "{{\"mem\":{{\"total_mb\":{total},\"avail_mb\":{avail},\"psi_some10\":{psi:.2},\"swap_total_mb\":{swap_total},\"swap_used_mb\":{swap_used}}},\"pressure\":{{\"avail_pct\":{avail_pct:.1},\"critical\":{critical}}},\"zswap\":{{\"available\":{zswap_avail},\"enabled\":{zswap_on}}},\"now\":{now_json},\"prefs\":{prefs},\"monitors\":[{}],{out},{bg_json},{sys_json}}}",
+        "{{\"mem\":{{\"total_mb\":{total},\"avail_mb\":{avail},\"psi_some10\":{psi:.2},\"swap_total_mb\":{swap_total},\"swap_used_mb\":{swap_used}}},\"pressure\":{{\"avail_pct\":{avail_pct:.1},\"critical\":{critical}}},\"zswap\":{{\"available\":{zswap_avail},\"enabled\":{zswap_on},\"zram\":{zram_backed}}},\"now\":{now_json},\"prefs\":{prefs},\"monitors\":[{}],{out},{bg_json},{sys_json}}}",
         mons_json.join(",")
     );
 }
