@@ -741,33 +741,17 @@ BarWidget {
       opacity: 1 - Math.min(1, mascot.playMorph * 1.8)
     }
     // Play triangle the eyes turn into: appears only after the eyes have
-    // left (second half of the morph), growing from the eye midpoint.
-    Shape {
-      x: 0
-      y: 0
-      width: 1200
-      height: 1200
+    // left (second half of the morph), growing from the eye midpoint. A Text
+    // glyph (not a Shape path) — fonts rasterize crisply at any scale.
+    Text {
+      text: "\u25B6"
+      color: mascot.tint
+      font.pixelSize: Math.max(1, mascot.width * 0.36)
+      x: parent.width * 0.5 - width / 2
+      y: parent.height * 0.4417 - height / 2
       opacity: Math.max(0, (mascot.playMorph - 0.45) / 0.55)
-      property real triGrow: Math.max(0, (mascot.playMorph - 0.45) / 0.55)
-      transform: [
-        Scale {
-          origin.x: 600
-          origin.y: 530
-          xScale: 0.55 + 0.45 * mascot.triGrow
-          yScale: 0.55 + 0.45 * mascot.triGrow
-        },
-        Scale {
-          xScale: mascot.width / 1200
-          yScale: mascot.height / 1200
-        }
-      ]
-      ShapePath {
-        fillColor: mascot.tint
-        strokeColor: "transparent"
-        PathSvg {
-          path: "M530,438 L714,530 L530,622 Z"
-        }
-      }
+      scale: 0.55 + 0.45 * Math.max(0, (mascot.playMorph - 0.45) / 0.55)
+      transformOrigin: Item.Center
     }
 
     // Humanized blink cycle: 1) both eyes, 2) left first with right lagging,
@@ -951,29 +935,58 @@ BarWidget {
       visible: true
       color: Qt.rgba(0.42, 0.44, 0.48, 0.55)
 
-      // Born transparent; positioned ~90ms after map, then faded in. This
-      // kills the "centered for a second, then snaps" flash (the compositor
-      // places new floating windows at the center until the poll moves them).
+      // Born transparent; faded in only AFTER the compositor confirms the
+      // window sits at the frozen window's rect. A blind 90ms timer still
+      // flashed the window at screen center for a frame or two.
       property real showAlpha: 0
       Timer {
         id: veilPlace
-        interval: 90
+        interval: 70
+        repeat: true
         onTriggered: {
           var sel = "title:^tm-veil:" + win.addr + "$"
           Quickshell.execDetached(["hyprctl", "dispatch",
             "hl.dsp.window.move({ x = " + win.x + ", y = " + win.y + ", window = \"" + sel + "\" })"])
           Quickshell.execDetached(["hyprctl", "dispatch",
             "hl.dsp.window.resize({ window = \"" + sel + "\", x = " + win.w + ", y = " + win.h + " })"])
-          veilShow.restart()
+          if (!veilPlaceCheck.running) veilPlaceCheck.running = true
         }
       }
-      Timer {
-        id: veilShow
-        interval: 80
-        onTriggered: veilWin.showAlpha = 1
+      Process {
+        id: veilPlaceCheck
+        command: ["hyprctl", "clients", "-j"]
+        stdout: StdioCollector {
+          waitForEnd: true
+          onStreamFinished: {
+            try {
+              var cs = JSON.parse(text)
+              for (var i = 0; i < cs.length; i++) {
+                if (cs[i].initialTitle === "tm-veil:" + win.addr
+                    && Math.abs(cs[i].at[0] - win.x) < 4
+                    && Math.abs(cs[i].at[1] - win.y) < 4
+                    && Math.abs(cs[i].size[0] - win.w) < 4
+                    && Math.abs(cs[i].size[1] - win.h) < 4) {
+                  veilPlace.stop()
+                  veilWin.showAlpha = 1
+                  return
+                }
+              }
+            } catch (e) {}
+          }
+        }
       }
-      Component.onCompleted: veilPlace.restart()
-      onVisibleChanged: if (visible) { veilWin.showAlpha = 0; veilPlace.restart() }
+      // Failsafe: never stay invisible (e.g. compositor settles 1px off).
+      Timer {
+        id: veilShowFailsafe
+        interval: 1200
+        onTriggered: { veilPlace.stop(); veilWin.showAlpha = 1 }
+      }
+      Component.onCompleted: { veilPlace.restart(); veilShowFailsafe.restart() }
+      onVisibleChanged: if (visible) {
+        veilWin.showAlpha = 0
+        veilPlace.restart()
+        veilShowFailsafe.restart()
+      }
 
       // Re-top: the frozen window was raised above us (user clicked through).
       property string retop: root.veilRetop
@@ -1009,6 +1022,9 @@ BarWidget {
         Column {
           anchors.centerIn: parent
           spacing: Style.space(4)
+          // Shrink to fit small frozen windows instead of overflowing them.
+          scale: Math.min(1, (win.w - 16) / 300, (win.h - 16) / 210)
+          transformOrigin: Item.Center
           // Omi doubles as a RESUME button on hover: its eyes morph into the
           // play triangle (animated both ways); clicking thaws straight from
           // the veil.
