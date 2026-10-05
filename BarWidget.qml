@@ -933,7 +933,9 @@ BarWidget {
       implicitWidth: Math.max(win.w, 1)
       implicitHeight: Math.max(win.h, 1)
       visible: true
-      color: Qt.rgba(0.42, 0.44, 0.48, 0.55)
+      // The window itself must be transparent: its background color ignores
+      // the content's opacity and would flash grey at screen center on map.
+      color: "transparent"
 
       // Born transparent; faded in only AFTER the compositor confirms the
       // window sits at the frozen window's rect. A blind 90ms timer still
@@ -1000,7 +1002,7 @@ BarWidget {
       Rectangle {
         anchors.fill: parent
         opacity: veilWin.showAlpha
-        color: "transparent"
+        color: Qt.rgba(0.42, 0.44, 0.48, 0.55)
         border.color: Qt.rgba(1, 1, 1, 0.28)
         border.width: 1
         radius: Style.cornerRadius
