@@ -689,7 +689,7 @@ BarWidget {
     // ~240px, capped at 3% of the mascot size). Both surfaces (popup and
     // veils) cover the same screen with the same origin, so mapToItem(null)
     // gives comparable coordinates in every window.
-    property point look: {
+    readonly property point lookTarget: {
       if (!root.cursorValid) return Qt.point(0, 0)
       var c = mascot.mapToItem(null, mascot.width / 2, mascot.height / 2)
       var dx = root.cursorX - c.x
@@ -699,6 +699,13 @@ BarWidget {
       var f = Math.min(d / 240, 1) * 0.030
       return Qt.point(dx / d * f, dy / d * f)
     }
+    // Smoothed: without the Behavior the eyes SNAP on the first hover (the
+    // "little flash"), because look jumps from rest to full lean instantly.
+    property real lookX: 0
+    property real lookY: 0
+    Behavior on lookX { NumberAnimation { duration: 140; easing.type: Easing.OutQuad } }
+    Behavior on lookY { NumberAnimation { duration: 140; easing.type: Easing.OutQuad } }
+    onLookTargetChanged: { lookX = lookTarget.x; lookY = lookTarget.y }
 
     Shape {
       x: 0
@@ -723,19 +730,19 @@ BarWidget {
       // empty transparent hole); roll orbits and the cursor look lean on top.
       // playMorph: eyes squash and fade FIRST (first 60% of the morph), then
       // the play triangle grows in — sequencing keeps the morph clean.
-      x: (mascot.eyeLx + Math.cos(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.x) * parent.width
+      x: (mascot.eyeLx + Math.cos(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.lookX) * parent.width
       width: mascot.eyeW * parent.width
       y: (mascot.eyeTop + mascot.eyeH * (1 - mascot.eyeOpenL) / 2
-          + Math.sin(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.y) * parent.height
+          + Math.sin(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.lookY) * parent.height
       height: Math.max(1.2, mascot.eyeH * parent.height * mascot.eyeOpenL)
       color: mascot.tint
       opacity: 1 - Math.min(1, mascot.playMorph * 1.8)
     }
     Rectangle {
-      x: (mascot.eyeRx + Math.cos(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.x) * parent.width
+      x: (mascot.eyeRx + Math.cos(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.lookX) * parent.width
       width: mascot.eyeW * parent.width
       y: (mascot.eyeTop + mascot.eyeH * (1 - mascot.eyeOpenR) / 2
-          + Math.sin(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.y) * parent.height
+          + Math.sin(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.lookY) * parent.height
       height: Math.max(1.2, mascot.eyeH * parent.height * mascot.eyeOpenR)
       color: mascot.tint
       opacity: 1 - Math.min(1, mascot.playMorph * 1.8)
@@ -1076,24 +1083,74 @@ BarWidget {
     }
   }
 
-  // Follow the frozen window's geometry and re-top veils as needed.
+  // Glue the veil and its frozen window in BOTH directions: whichever one
+  // changed since the last sync wins, the other is moved/resized to match.
+  // (Hyprland has no window groups; resizing the veil with SUPER+drag
+  // otherwise resized only the veil, never the frozen app below it.)
+  property var veilSync: ({})
   Timer {
     interval: 400
     repeat: true
     running: root.veilOwner && root.frozenCount > 0
-    onTriggered: {
-      for (var i = 0; i < root.frozenWins.length; i++) {
-        var w = root.frozenWins[i]
-        var sel = "title:^tm-veil:" + w.addr + "$"
-        if (!w.pinned)
-          Quickshell.execDetached(["hyprctl", "dispatch",
-            "hl.dsp.window.move({ workspace = \"" + w.ws + "\", follow = false, window = \"" + sel + "\" })"])
-        Quickshell.execDetached(["hyprctl", "dispatch",
-          "hl.dsp.window.move({ x = " + w.x + ", y = " + w.y + ", window = \"" + sel + "\" })"])
-        Quickshell.execDetached(["hyprctl", "dispatch",
-          "hl.dsp.window.resize({ window = \"" + sel + "\", x = " + w.w + ", y = " + w.h + " })"])
+    onTriggered: if (!veilSyncProc.running) veilSyncProc.running = true
+  }
+  Process {
+    id: veilSyncProc
+    command: ["hyprctl", "clients", "-j"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var cs = JSON.parse(text)
+          var sync = root.veilSync
+          for (var i = 0; i < root.frozenWins.length; i++) {
+            var w = root.frozenWins[i]
+            var rw = null, vw = null
+            for (var j = 0; j < cs.length; j++) {
+              if (cs[j].address === w.addr) rw = cs[j]
+              else if (cs[j].initialTitle === "tm-veil:" + w.addr) vw = cs[j]
+            }
+            if (!rw || !vw) continue
+            var last = sync[w.addr] || { x: w.x, y: w.y, w: w.w, h: w.h }
+            var rr = { x: rw.at[0], y: rw.at[1], w: rw.size[0], h: rw.size[1] }
+            var vr = { x: vw.at[0], y: vw.at[1], w: vw.size[0], h: vw.size[1] }
+            var eq = function(a, b) {
+              return Math.abs(a.x - b.x) < 3 && Math.abs(a.y - b.y) < 3
+                  && Math.abs(a.w - b.w) < 3 && Math.abs(a.h - b.h) < 3
+            }
+            var winChanged = !eq(rr, last)
+            var veilChanged = !eq(vr, last)
+            var vsel = "title:^tm-veil:" + w.addr + "$"
+            var wsel = "address:" + w.addr
+            if (veilChanged && !winChanged && rw.floating) {
+              // The user dragged/resized the VEIL: glue the real window to
+              // it. Only possible when the frozen window is FLOATING —
+              // tiled windows are owned by the layout, so there the veil
+              // just snaps back (else branch).
+              Quickshell.execDetached(["hyprctl", "dispatch",
+                "hl.dsp.window.move({ x = " + vr.x + ", y = " + vr.y + ", window = \"" + wsel + "\" })"])
+              Quickshell.execDetached(["hyprctl", "dispatch",
+                "hl.dsp.window.resize({ window = \"" + wsel + "\", x = " + vr.w + ", y = " + vr.h + " })"])
+              sync[w.addr] = vr
+            } else {
+              // Default: the veil follows the window (geometry + workspace).
+              if (winChanged || !eq(vr, rr)) {
+                Quickshell.execDetached(["hyprctl", "dispatch",
+                  "hl.dsp.window.move({ x = " + rr.x + ", y = " + rr.y + ", window = \"" + vsel + "\" })"])
+                Quickshell.execDetached(["hyprctl", "dispatch",
+                  "hl.dsp.window.resize({ window = \"" + vsel + "\", x = " + rr.w + ", y = " + rr.h + " })"])
+              }
+              if (!w.pinned && rw.workspace && vw.workspace
+                  && rw.workspace.id !== vw.workspace.id)
+                Quickshell.execDetached(["hyprctl", "dispatch",
+                  "hl.dsp.window.move({ workspace = \"" + rw.workspace.id + "\", follow = false, window = \"" + vsel + "\" })"])
+              sync[w.addr] = rr
+            }
+          }
+          root.veilSync = sync
+        } catch (e) {}
+        if (!veilActiveWinProc.running) veilActiveWinProc.running = true
       }
-      if (!veilActiveWinProc.running) veilActiveWinProc.running = true
     }
   }
   Process {
