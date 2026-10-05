@@ -721,41 +721,40 @@ BarWidget {
     Rectangle {
       // Left eye. Blink squashes around its center down to a SLIT (never an
       // empty transparent hole); roll orbits and the cursor look lean on top.
-      // playMorph slides it toward the center and collapses it into the play
-      // triangle (right eye mirrors; the triangle grows in behind).
-      x: ((mascot.eyeLx + (0.462 - mascot.eyeLx) * mascot.playMorph)
-          + (1 - mascot.playMorph) * (Math.cos(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.x)) * parent.width
-      width: Math.max(0.8, mascot.eyeW * (1 - 0.85 * mascot.playMorph)) * parent.width
+      // playMorph: eyes squash and fade FIRST (first 60% of the morph), then
+      // the play triangle grows in — sequencing keeps the morph clean.
+      x: (mascot.eyeLx + Math.cos(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.x) * parent.width
+      width: mascot.eyeW * parent.width
       y: (mascot.eyeTop + mascot.eyeH * (1 - mascot.eyeOpenL) / 2
           + Math.sin(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.y) * parent.height
       height: Math.max(1.2, mascot.eyeH * parent.height * mascot.eyeOpenL)
       color: mascot.tint
-      opacity: 1 - mascot.playMorph
+      opacity: 1 - Math.min(1, mascot.playMorph * 1.8)
     }
     Rectangle {
-      x: ((mascot.eyeRx + (0.538 - mascot.eyeRx) * mascot.playMorph)
-          + (1 - mascot.playMorph) * (Math.cos(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.x)) * parent.width
-      width: Math.max(0.8, mascot.eyeW * (1 - 0.85 * mascot.playMorph)) * parent.width
+      x: (mascot.eyeRx + Math.cos(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.x) * parent.width
+      width: mascot.eyeW * parent.width
       y: (mascot.eyeTop + mascot.eyeH * (1 - mascot.eyeOpenR) / 2
           + Math.sin(mascot.rollAng * Math.PI / 180) * mascot.rollR + mascot.look.y) * parent.height
       height: Math.max(1.2, mascot.eyeH * parent.height * mascot.eyeOpenR)
       color: mascot.tint
-      opacity: 1 - mascot.playMorph
+      opacity: 1 - Math.min(1, mascot.playMorph * 1.8)
     }
-    // Play triangle the eyes morph into: grows out of the eye line with a
-    // slight overshoot, centered on the eye midpoint (600,530 in logo units).
+    // Play triangle the eyes turn into: appears only after the eyes have
+    // left (second half of the morph), growing from the eye midpoint.
     Shape {
       x: 0
       y: 0
       width: 1200
       height: 1200
-      opacity: mascot.playMorph
+      opacity: Math.max(0, (mascot.playMorph - 0.45) / 0.55)
+      property real triGrow: Math.max(0, (mascot.playMorph - 0.45) / 0.55)
       transform: [
         Scale {
           origin.x: 600
           origin.y: 530
-          xScale: 0.25 + 0.75 * mascot.playMorph
-          yScale: 0.25 + 0.75 * mascot.playMorph
+          xScale: 0.55 + 0.45 * mascot.triGrow
+          yScale: 0.55 + 0.45 * mascot.triGrow
         },
         Scale {
           xScale: mascot.width / 1200
@@ -766,7 +765,7 @@ BarWidget {
         fillColor: mascot.tint
         strokeColor: "transparent"
         PathSvg {
-          path: "M522,430 L722,530 L522,630 Z"
+          path: "M530,438 L714,530 L530,622 Z"
         }
       }
     }
@@ -1159,22 +1158,22 @@ BarWidget {
     anchors { top: true; left: true; right: true; bottom: true }
     color: "transparent"
     exclusionMode: ExclusionMode.Ignore
-    // Pinned: input region shrinks to the card — clicks outside pass through
-    // to the windows below. Unpinned: full-screen area catches outside
-    // clicks to close the popup.
-    mask: root.pinned ? cardInputRegion : null
+    // Input is ALWAYS limited to the card: outside clicks and hover pass
+    // through to the windows below — frozen-app veils stay interactive
+    // (hover morph + Omi play-resume) while the popup is open. The popup
+    // closes via the toggle keybind or the card's close button.
+    mask: Region { item: card }
     WlrLayershell.namespace: "tm-popup"
     WlrLayershell.layer: WlrLayer.Overlay
-    // Keyboard: unpinned popup grabs input (arrows/shortcuts work the moment
-    // it opens, Esc closes). Pinned must never steal keys from real windows.
-    WlrLayershell.keyboardFocus: root.pinned ? WlrKeyboardFocus.None : WlrKeyboardFocus.Exclusive
+    // OnDemand: the card takes keyboard only after a deliberate click on it.
+    // (Exclusive would make Hyprland route ALL pointer input to this overlay
+    // surface, killing hover/click on the floating veils below — verified.)
+    WlrLayershell.keyboardFocus: WlrKeyboardFocus.OnDemand
     onWidthChanged: root.maybeCenterCard()
     onHeightChanged: root.maybeCenterCard()
 
-    Region { id: cardInputRegion; item: card }
-
-    // Click outside the card closes the popup (unless pinned). Also feeds
-    // the cursor position so the mascots' eyes can follow it.
+    // Feeds the cursor position so the mascots' eyes can follow it (within
+    // the card — the mask blocks everything outside it anyway).
     MouseArea {
       anchors.fill: parent
       hoverEnabled: true
@@ -1183,7 +1182,6 @@ BarWidget {
         root.cursorY = mouse.y
         root.cursorValid = true
       }
-      onClicked: if (!root.pinned) root.closePopup()
     }
 
     Rectangle {
