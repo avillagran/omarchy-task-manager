@@ -1016,9 +1016,12 @@ BarWidget {
 
         // Clicks on the veil forward focus to the frozen window (it cannot
         // respond anyway — frozen); the poll re-tops the veil afterwards.
+        // Hover count boosts the sync cadence so drags track closely.
         MouseArea {
           anchors.fill: parent
           hoverEnabled: true
+          onEntered: root.veilHoverCount++
+          onExited: root.veilHoverCount = Math.max(0, root.veilHoverCount - 1)
           onPositionChanged: function(mouse) {
             root.cursorX = win.x + mouse.x
             root.cursorY = win.y + mouse.y
@@ -1083,13 +1086,53 @@ BarWidget {
     }
   }
 
+  // Event-driven sync: the helper streams Hyprland socket2 events so veils
+  // react instantly (retop on focus of a frozen window, follow on workspace
+  // moves, cleanup on close) instead of waiting for the 400ms poll.
+  property bool veilEventsDead: false
+  Process {
+    id: veilEventsProc
+    running: root.veilOwner && root.frozenCount > 0 && !root.veilEventsDead
+    command: [root.binPath, "follow"]
+    stdout: SplitParser {
+      onRead: data => {
+        if (data.startsWith("activewindowv2>>")) {
+          // Event addresses lack the 0x prefix clients JSON carries.
+          var addr = "0x" + data.substring(16).trim()
+          for (var i = 0; i < root.frozenWins.length; i++) {
+            if (root.frozenWins[i].addr === addr) {
+              root.veilRetop = addr + ":" + Date.now()
+              break
+            }
+          }
+        } else {
+          if (!veilSyncProc.running) veilSyncProc.running = true
+          if (data.startsWith("closewindow>>") && !scanProc.running)
+            scanProc.running = true
+        }
+      }
+    }
+    onExited: {
+      root.veilEventsDead = true
+      veilEventsRestart.restart()
+    }
+  }
+  Timer {
+    id: veilEventsRestart
+    interval: 1500
+    onTriggered: root.veilEventsDead = false
+  }
+
   // Glue the veil and its frozen window in BOTH directions: whichever one
   // changed since the last sync wins, the other is moved/resized to match.
   // (Hyprland has no window groups; resizing the veil with SUPER+drag
   // otherwise resized only the veil, never the frozen app below it.)
+  // Steady cadence 400ms; while a veil is hovered (likely being dragged)
+  // tighten to 120ms so the frozen window tracks the drag closely.
+  property int veilHoverCount: 0
   property var veilSync: ({})
   Timer {
-    interval: 400
+    interval: root.veilHoverCount > 0 ? 120 : 400
     repeat: true
     running: root.veilOwner && root.frozenCount > 0
     onTriggered: if (!veilSyncProc.running) veilSyncProc.running = true

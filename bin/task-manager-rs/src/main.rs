@@ -1470,9 +1470,42 @@ fn cmd_zswap_copy() {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: task-manager <state|wins PID|freeze PID|thaw PID|focus PID|kill PID|freeze-pid PID|thaw-pid PID|kill-pid PID|procs PID|zswap-copy|pref K V|history|watch>"
+        "usage: task-manager <state|wins PID|freeze PID|thaw PID|focus PID|kill PID|freeze-pid PID|thaw-pid PID|kill-pid PID|procs PID|zswap-copy|pref K V|history|watch|follow>"
     );
     std::process::exit(1)
+}
+
+/// Stream compositor events (Hyprland socket2), one per line, so the QML
+/// veil layer can react INSTANTLY instead of polling: retop on focus,
+/// follow on workspace moves, cleanup on close. Only veil-relevant events
+/// are forwarded.
+fn cmd_follow() {
+    use std::io::{BufRead, BufReader, Write};
+    let his = env::var("HYPRLAND_INSTANCE_SIGNATURE").unwrap_or_default();
+    let path = format!("{}/hypr/{}/.socket2.sock", runtime_dir(), his);
+    let sock = match std::os::unix::net::UnixStream::connect(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("follow: connect {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let reader = BufReader::new(sock);
+    let mut out = std::io::stdout().lock();
+    for line in reader.lines() {
+        let Ok(l) = line else { break };
+        if l.starts_with("activewindowv2>>")
+            || l.starts_with("movewindowv2>>")
+            || l.starts_with("closewindow>>")
+            || l.starts_with("openwindow>>")
+            || l.starts_with("workspace>>")
+            || l.starts_with("changefloatingmode>>")
+        {
+            if writeln!(out, "{l}").is_err() || out.flush().is_err() {
+                break; // consumer gone
+            }
+        }
+    }
 }
 
 fn main() {
@@ -1491,6 +1524,7 @@ fn main() {
         "kill-pid" if args.len() == 3 => cmd_kill_pid(args[2].parse().unwrap_or_else(|_| usage())),
         "zswap-copy" => cmd_zswap_copy(),
         "watch" => cmd_watch(),
+        "follow" => cmd_follow(),
         "history" => cmd_history(),
         "procs" if args.len() == 3 => cmd_procs(args[2].parse().unwrap_or_else(|_| usage())),
         "pref" if args.len() == 4 => cmd_pref(&args[2], &args[3]),
