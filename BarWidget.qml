@@ -42,7 +42,9 @@ BarWidget {
       var roles = {
         "pid": a.pid, "name": a.name, "title": a.title || "",
         "rss_mb": a.rss_mb, "frozen": !!a.frozen, "procs": a.procs || 1,
-        "windows": a.windows || 0, "unit": a.unit || ""
+        "windows": a.windows || 0, "unit": a.unit || "",
+        "wintitles": (a.wins || []).map(function(w) { return w.title || "" })
+          .filter(function(t) { return t !== "" }).join("\n")
       }
       if (idx === -1) appsModel.append(roles)
       else appsModel.set(idx, roles)
@@ -1770,6 +1772,22 @@ BarWidget {
                   }
                 }
 
+                // Window titles (active tab title per window for browsers)
+                // — much more informative than bare process names.
+                Repeater {
+                  model: app.wintitles ? app.wintitles.split("\n") : []
+                  Text {
+                    required property string modelData
+                    width: parent.width - Style.space(20)
+                    x: Style.space(20)
+                    text: "▸ " + modelData
+                    color: Qt.darker(Color.popups.text, 1.15)
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
+                }
+
                 // Expanded subprocess rows (tree view). Each row carries
                 // pause + kill so a single hung thread (classic: a browser
                 // tab/renderer eating RAM) can be stopped without touching
@@ -1795,7 +1813,10 @@ BarWidget {
 
                       Text {
                         Layout.fillWidth: true
-                        text: "└ " + proc.comm
+                        // Role beats comm: chromium/electron children all
+                        // share the parent's comm, the role is the real info
+                        // ("renderer" = a tab, "gpu", "network", ...).
+                        text: "└ " + (proc.role && proc.role !== "" ? proc.role : proc.comm)
                         color: Qt.darker(Color.popups.text, 1.3)
                         font.family: root.iconFont
                         font.pixelSize: Style.font.caption

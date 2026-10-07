@@ -465,7 +465,7 @@ fn json_escape(s: &str) -> String {
 
 fn win_json(w: &Win) -> String {
     format!(
-        "{{\"addr\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"ws\":{},\"mon\":\"{}\",\"pinned\":{}}}",
+        "{{\"addr\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"ws\":{},\"mon\":\"{}\",\"pinned\":{},\"title\":\"{}\"}}",
         w.address,
         w.x,
         w.y,
@@ -473,8 +473,44 @@ fn win_json(w: &Win) -> String {
         w.h,
         w.ws,
         json_escape(&w.monitor),
-        w.pinned
+        w.pinned,
+        json_escape(&w.title)
     )
+}
+
+/// Human role of a subprocess, parsed from its cmdline. Chromium/Electron
+/// children all share the parent's comm; the --type flag is what
+/// distinguishes a tab renderer from the GPU process or network service.
+fn proc_role(pid: u64) -> String {
+    let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return String::new();
+    };
+    let s = String::from_utf8_lossy(&raw).replace('\0', " ");
+    if let Some(i) = s.find("--type=") {
+        let t = &s[i + 7..];
+        let end = t.find(' ').unwrap_or(t.len());
+        return match &t[..end] {
+            "renderer" => "renderer".into(),
+            "gpu-process" => "gpu".into(),
+            "utility" => {
+                // --utility-sub-type=network.mojom.NetworkService -> "network"
+                if let Some(j) = s.find("--utility-sub-type=") {
+                    let u = &s[j + 19..];
+                    let ue = u.find(' ').unwrap_or(u.len());
+                    u[..ue].split('.').next().unwrap_or("utility").to_string()
+                } else {
+                    "utility".into()
+                }
+            }
+            "zygote" => "zygote".into(),
+            "crashpad-handler" => "crashpad".into(),
+            other => other.to_string(),
+        };
+    }
+    if s.contains("crashpad") {
+        return "crashpad".into();
+    }
+    String::new()
 }
 
 /// All user pids sharing a comm (the app's full "family", across scopes —
@@ -1148,8 +1184,9 @@ fn cmd_procs(pid: u64) {
         .iter()
         .map(|(p, c, r, s)| {
             format!(
-                "{{\"pid\":{p},\"comm\":\"{}\",\"rss_mb\":{r},\"state\":\"{s}\"}}",
-                json_escape(c)
+                "{{\"pid\":{p},\"comm\":\"{}\",\"role\":\"{}\",\"rss_mb\":{r},\"state\":\"{s}\"}}",
+                json_escape(c),
+                json_escape(&proc_role(*p))
             )
         })
         .collect();
