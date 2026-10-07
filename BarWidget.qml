@@ -47,7 +47,17 @@ BarWidget {
           .filter(function(t) { return t !== "" }).join("\n")
       }
       if (idx === -1) appsModel.append(roles)
-      else appsModel.set(idx, roles)
+      else {
+        // Diff-first: ListModel.set() emits dataChanged even for identical
+        // values, which repaints rows and can shift heights (wintitles).
+        var cur = appsModel.get(idx)
+        var diff = {}
+        var changed = false
+        for (var key in roles) {
+          if (cur[key] !== roles[key]) { diff[key] = roles[key]; changed = true }
+        }
+        if (changed) appsModel.set(idx, diff)
+      }
     }
     // Order to match arr via move() (delegate reuse, no rebuild flash).
     for (i = 0; i < arr.length && i < appsModel.count; i++) {
@@ -96,6 +106,7 @@ BarWidget {
   property real cpuNow: 0.0
   property real memNow: 0.0
   property var expandedProcs: ({})
+  property var procsRaw: ({})
   property var procsData: ({})
   property var procsQueue: []
   property int pendingProcsPid: 0
@@ -290,13 +301,23 @@ BarWidget {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var pd = root.procsData
-        try {
-          pd[root.pendingProcsPid] = JSON.parse(text || "[]")
-        } catch (e) {
-          pd[root.pendingProcsPid] = []
+        // Only touch the model when the data actually changed: assigning a
+        // fresh array on every fetch rebuilds every expanded row, which
+        // redraws the list and resets the scroll position.
+        var pid = root.pendingProcsPid
+        var raw = (text || "[]").trim()
+        if (raw !== (root.procsRaw[pid] || "")) {
+          var pr = root.procsRaw
+          pr[pid] = raw
+          root.procsRaw = pr
+          var pd = root.procsData
+          try {
+            pd[pid] = JSON.parse(raw)
+          } catch (e) {
+            pd[pid] = []
+          }
+          root.procsData = Object.assign({}, pd)
         }
-        root.procsData = Object.assign({}, pd)
         if (root.procsQueue.length > 0) {
           var next = root.procsQueue.shift()
           root.runProcs(next)
@@ -425,8 +446,8 @@ BarWidget {
         root.cpuNow = data.now.cpu || 0.0
         root.memNow = data.now.mem || 0.0
       }
-      // Refresh expanded trees with fresh data.
-      root.procsData = {}
+      // Refresh expanded trees with fresh data (unchanged payloads are
+      // dropped inside procsProc, so this does not churn the UI).
       for (var pid in root.expandedProcs) {
         if (root.expandedProcs[pid]) root.fetchProcs(parseInt(pid))
       }
