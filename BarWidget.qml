@@ -232,7 +232,10 @@ BarWidget {
 
   // Fast poll while the popup is open or any app is frozen (veil tracking).
   Timer {
-    interval: (root.popupOpen || root.frozenCount > 0) ? 2000 : 15000
+    // Slow cadence is 3s (state scan costs ~30ms): the watchdog's
+    // auto-freeze must surface as a veil almost immediately, not up to
+    // 15s later.
+    interval: (root.popupOpen || root.frozenCount > 0) ? 2000 : 3000
     repeat: true
     running: true
     onTriggered: root.refresh()
