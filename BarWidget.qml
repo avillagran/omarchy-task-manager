@@ -1791,19 +1791,28 @@ BarWidget {
                   }
                 }
 
-                // Window titles (active tab title per window for browsers)
-                // — much more informative than bare process names. app comes
-                // from root.apps (raw state array), so wins is available.
+                // Browser tabs (live, from the companion extension via the
+                // native bridge) — every tab, not just the active one per
+                // window. Falls back to window titles when the bridge is
+                // not installed. app comes from root.apps (raw state array).
                 Repeater {
                   model: root.expandedProcs[app.pid]
-                         ? (app.wins || []).filter(function(w) { return w.title && w.title !== "" })
+                         ? ((app.tabs && app.tabs.length)
+                            ? app.tabs
+                            : (app.wins || []).filter(function(w) { return w.title && w.title !== "" }))
                          : []
                   Text {
                     required property var modelData
+                    // tab objects carry .active; window objects do not
+                    readonly property bool isTab: modelData.active !== undefined
+                    text: (isTab ? (modelData.active ? "▸ " : "· ") : "▸ ")
+                          + (modelData.title || modelData.url || "")
+                    color: isTab && modelData.active
+                           ? Qt.darker(Color.popups.text, 1.05)
+                           : Qt.darker(Color.popups.text, 1.15)
+                    opacity: isTab && !modelData.active ? 0.75 : 1.0
                     width: parent.width - Style.space(20)
                     x: Style.space(20)
-                    text: "▸ " + modelData.title
-                    color: Qt.darker(Color.popups.text, 1.15)
                     font.family: Style.font.family
                     font.pixelSize: Style.font.caption
                     elide: Text.ElideRight

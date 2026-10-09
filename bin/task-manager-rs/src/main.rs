@@ -770,13 +770,18 @@ fn cmd_state() {
         }
         first = false;
         let wins_json: Vec<String> = wins.iter().map(win_json).collect();
+        // Browser families get the live tab list reported by the companion
+        // extension (written to the cache by `tabs-host`); others get [].
+        let c = comm(*pid);
+        let tabs_json = if is_browser_comm(&c) { tabs_cache_json() } else { "[]".to_string() };
         out.push_str(&format!(
-            "{{\"pid\":{pid},\"name\":\"{}\",\"title\":\"{}\",\"rss_mb\":{rss_mb},\"unit\":\"{}\",\"mechanism\":\"{mechanism}\",\"frozen\":{frozen},\"windows\":{},\"procs\":{nprocs},\"wins\":[{}]}}",
-            json_escape(&comm(*pid)),
+            "{{\"pid\":{pid},\"name\":\"{}\",\"title\":\"{}\",\"rss_mb\":{rss_mb},\"unit\":\"{}\",\"mechanism\":\"{mechanism}\",\"frozen\":{frozen},\"windows\":{},\"procs\":{nprocs},\"wins\":[{}],\"tabs\":{}}}",
+            json_escape(&c),
             json_escape(&wins[0].title),
             json_escape(unit),
             wins.len(),
-            wins_json.join(",")
+            wins_json.join(","),
+            tabs_json
         ));
     }
     out.push(']');
@@ -1545,6 +1550,102 @@ fn cmd_follow() {
     }
 }
 
+/// Native Messaging host for the companion "Omarchy Task Manager Tabs"
+/// extension. Chrome spawns one host process per message: read one framed
+/// message (4-byte LE length + JSON), persist the tab list atomically
+/// (user-only, 0600), reply {"ok":true}, exit.
+fn cmd_tabs_host() {
+    use std::io::{Read, Write};
+    let stdin = std::io::stdin();
+    let mut len = [0u8; 4];
+    if stdin.lock().read_exact(&mut len).is_err() {
+        std::process::exit(1);
+    }
+    let n = u32::from_le_bytes(len) as usize;
+    if n == 0 || n > 4 * 1024 * 1024 {
+        std::process::exit(1);
+    }
+    let mut buf = vec![0u8; n];
+    if stdin.lock().read_exact(&mut buf).is_err() {
+        std::process::exit(1);
+    }
+    let Ok(v) = serde_json::from_slice::<Value>(&buf) else {
+        std::process::exit(1);
+    };
+    let Some(tabs) = v.get("tabs").and_then(|t| t.as_array()) else {
+        std::process::exit(1);
+    };
+    let Some(home) = env::var_os("HOME") else {
+        std::process::exit(1);
+    };
+    let dir = Path::new(&home).join(".cache/omarchy/task-manager");
+    let _ = fs::create_dir_all(&dir);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let out = serde_json::json!({ "updatedAt": now, "tabs": tabs }).to_string();
+    let tmp = dir.join(format!("tabs.json.{}", std::process::id()));
+    let dst = dir.join("tabs.json");
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+        {
+            use std::io::Write as _;
+            if f.write_all(out.as_bytes()).is_ok() {
+                let _ = fs::rename(&tmp, &dst);
+            }
+        }
+    }
+    let reply = b"{\"ok\":true}";
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(&(reply.len() as u32).to_le_bytes());
+    let _ = stdout.write_all(reply);
+    let _ = stdout.flush();
+}
+
+/// Browser comms that consume the tabs cache.
+fn is_browser_comm(c: &str) -> bool {
+    let l = c.to_lowercase();
+    l.contains("chrom") || l.contains("brave") || l.contains("edge")
+}
+
+/// The tabs cache as a JSON array string, only while fresh (the extension
+/// reports on every tab event; stale >2min means the browser/bridge is off).
+fn tabs_cache_json() -> String {
+    let Some(home) = env::var_os("HOME") else {
+        return "[]".into();
+    };
+    let path = Path::new(&home).join(".cache/omarchy/task-manager/tabs.json");
+    let Ok(meta) = fs::metadata(&path) else {
+        return "[]".into();
+    };
+    let fresh = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .map(|e| e.as_secs() < 120)
+        .unwrap_or(false);
+    if !fresh {
+        return "[]".into();
+    }
+    let Ok(text) = fs::read_to_string(&path) else {
+        return "[]".into();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return "[]".into();
+    };
+    v.get("tabs")
+        .and_then(|t| t.as_array())
+        .map(|a| Value::Array(a.clone()).to_string())
+        .unwrap_or_else(|| "[]".into())
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -1562,6 +1663,7 @@ fn main() {
         "zswap-copy" => cmd_zswap_copy(),
         "watch" => cmd_watch(),
         "follow" => cmd_follow(),
+        "tabs-host" => cmd_tabs_host(),
         "history" => cmd_history(),
         "procs" if args.len() == 3 => cmd_procs(args[2].parse().unwrap_or_else(|_| usage())),
         "pref" if args.len() == 4 => cmd_pref(&args[2], &args[3]),

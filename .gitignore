@@ -5,3 +5,6 @@ bin/task-manager-rs/target/
 .DS_Store
 *.swp
 *~
+
+# Extension signing key (kept only on the maintainer machine)
+bridge-extension/*.pem

@@ -58,6 +58,8 @@ uninstall() {
   systemctl --user daemon-reload
   remove_keybind
   remove_veil_rule
+  bash "$HERE/bin/task-manager-bridge-install.sh" uninstall >/dev/null 2>&1 || true
+  rm -f "$HOME/.cache/omarchy/task-manager/tabs.json" 2>/dev/null || true
   omarchy plugin disable "$PLUGIN_ID" >/dev/null 2>&1 || true
   # Remove only a dev symlink we manage; real installs stay for
   # `omarchy plugin remove` (user's explicit call).
@@ -174,6 +176,12 @@ main() {
   dir="$(plugin_dir)" || { log "plugin dir not found after install"; exit 1; }
   install_unit "$dir"
   install_veil_rule
+  # Register the Native Messaging host (user scope, no root) so the
+  # companion "Tabs" extension can report tab titles to the plugin.
+  # The extension itself is loaded by the user (Load unpacked / store).
+  bash "$dir/bin/task-manager-bridge-install.sh" install >/dev/null 2>&1 \
+    && log "tab bridge native host registered" \
+    || log "tab bridge registration skipped (no browser config dir)"
   # The SUPER+SHIFT+T keybind is opt-in from the card (keyboard icon); if a
   # previous version already enabled it, leave the user's bind untouched.
   omarchy-restart-shell >/dev/null 2>&1 || true

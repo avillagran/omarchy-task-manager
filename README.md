@@ -75,6 +75,28 @@ echo "w /sys/module/zswap/parameters/enabled - - - - Y" | sudo tee /etc/tmpfiles
 The card detects a missing zswap and shows these commands with a copy
 button.
 
+## Browser tab titles (optional bridge)
+
+Chrome/Chromium/Brave expanded rows can list **every open tab** (title, not
+just the active one per window). The OS cannot provide this — nothing in
+`/proc` maps a renderer pid to a tab — so the data comes from a tiny
+companion extension, over Chrome's Native Messaging, 100% local:
+
+- `install.sh` registers the native host **user-scoped** (no root) for
+  every browser profile dir it finds. Safe to re-run; unregistered by
+  `install.sh --uninstall`.
+- Load the extension once: `chrome://extensions` → Developer mode →
+  **Load unpacked** → `bridge-extension/source`. From then on the expanded
+  browser row shows all tabs (active marked ▸), refreshing live.
+- The extension is read-only (permissions: `tabs` + `nativeMessaging`),
+  never touches page content, and writes only to
+  `~/.cache/omarchy/task-manager/tabs.json` (mode 0600).
+- A store-ready package is included: `bridge-extension/omarchy-task-manager-tabs.cws.zip`.
+  Uploading it to the Chrome Web Store (unlisted listing is fine) turns
+  the extension step into a one-click install; the manifest's fixed `key`
+  keeps the extension ID stable, so the native host registration keeps
+  working unchanged.
+
 ## Layout
 
     manifest.json
