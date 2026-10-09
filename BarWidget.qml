@@ -42,9 +42,7 @@ BarWidget {
       var roles = {
         "pid": a.pid, "name": a.name, "title": a.title || "",
         "rss_mb": a.rss_mb, "frozen": !!a.frozen, "procs": a.procs || 1,
-        "windows": a.windows || 0, "unit": a.unit || "",
-        "wintitles": (a.wins || []).map(function(w) { return w.title || "" })
-          .filter(function(t) { return t !== "" }).join("\n")
+        "windows": a.windows || 0, "unit": a.unit || ""
       }
       if (idx === -1) appsModel.append(roles)
       else {
@@ -1794,14 +1792,17 @@ BarWidget {
                 }
 
                 // Window titles (active tab title per window for browsers)
-                // — much more informative than bare process names.
+                // — much more informative than bare process names. app comes
+                // from root.apps (raw state array), so wins is available.
                 Repeater {
-                  model: app.wintitles ? app.wintitles.split("\n") : []
+                  model: root.expandedProcs[app.pid]
+                         ? (app.wins || []).filter(function(w) { return w.title && w.title !== "" })
+                         : []
                   Text {
-                    required property string modelData
+                    required property var modelData
                     width: parent.width - Style.space(20)
                     x: Style.space(20)
-                    text: "▸ " + modelData
+                    text: "▸ " + modelData.title
                     color: Qt.darker(Color.popups.text, 1.15)
                     font.family: Style.font.family
                     font.pixelSize: Style.font.caption
