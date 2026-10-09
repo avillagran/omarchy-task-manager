@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Omarchy Task Manager Tabs",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Shares your browser's open tab titles with the Omarchy Task Manager plugin, locally. Nothing leaves your computer; no accounts, no network calls.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAi2+GJy5NveihSOIXWaW4WxNSjQP9YUHXgRkKigPuOUrPS/kuYsl8fjgupxOIv3ROo1Gtc4b8OYISvebFy5UXDCWzrjYVX4aKznniVRFK2HamZWgbDLnXzOHZrplyvtcybfTh70lsmtDtp8ksYn1J/J1hVssTwx22IyYWZuGYWWqhy1dvgyH7Uwd07u5hLoUaVWDvLYr3Ukiyay4NH+xlJgkaNT1JVTvNOu2oqQ0Sddm0iiL2sOHJWEnzMRgd0N0xNhGhKphkB6dVjwvwiheh28wTc3BJAxe8zgUKE/Xy5DMAODqL5UGr/Nvu23q8zG9eu/lbYkAmKkxwtrSEuo6LGwIDAQAB",
   "permissions": ["nativeMessaging", "tabs"],

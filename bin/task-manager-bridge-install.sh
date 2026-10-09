@@ -73,7 +73,7 @@ case "${1:-install}" in
   # from there on next start. This is the ONLY root-requiring step and it
   # is a single auditable file write; everything else is user-scoped.
   auto)
-    json='{ "external_update_url": "https://github.com/avillagran/omarchy-task-manager/releases/download/tabs-bridge-v0.1.0/update.xml" }'
+    json='{ "external_update_url": "https://github.com/avillagran/omarchy-task-manager/releases/download/tabs-bridge/update.xml" }'
     target="/opt/google/chrome/extensions/$EXT_ID.json"
     if [ -f "$target" ]; then
       echo "already installed: $target"

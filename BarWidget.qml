@@ -513,6 +513,14 @@ BarWidget {
     // name) when THEY want it focused.
   }
 
+  // Unload a browser tab (free its memory; it reloads on focus) via the
+  // native bridge: helper queues the command, the tabs host forwards it to
+  // the extension, chrome.tabs.discard does the rest.
+  function tabDiscard(tabId) {
+    Quickshell.execDetached([root.binPath, "tabs-cmd", "discard", String(tabId)])
+    settleTimer.restart()
+  }
+
   function resumeAll() {
     for (var i = 0; i < root.apps.length; i++) {
       if (root.apps[i].frozen) {
@@ -1836,24 +1844,43 @@ BarWidget {
                             ? root.tabGroups(app)
                             : (app.wins || []).filter(function(w) { return w.title && w.title !== "" }))
                          : []
-                  Text {
+                  Rectangle {
                     required property var modelData
                     // header rows = window groups; tab objects carry .active;
                     // bare window objects (fallback) have neither
                     readonly property bool isHeader: modelData.header === true
                     readonly property bool isTab: modelData.active !== undefined
-                    text: isHeader ? ("▾ " + modelData.title)
-                          : (isTab ? (modelData.active ? "▸ " : "· ") : "▸ ")
-                            + (modelData.title || modelData.url || "")
-                    color: isHeader || (isTab && modelData.active)
-                           ? Qt.darker(Color.popups.text, 1.05)
-                           : Qt.darker(Color.popups.text, 1.15)
-                    opacity: isTab && !modelData.active ? 0.75 : 1.0
+                    readonly property bool canDiscard: isTab && !isHeader
+                        && !modelData.active && !modelData.discarded
                     width: parent.width - Style.space(20)
                     x: isHeader ? Style.space(20) : Style.space(32)
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.caption
-                    elide: Text.ElideRight
+                    height: Math.max(tabText.implicitHeight, 16) + (isHeader ? Style.space(4) : Style.space(2))
+                    color: "transparent"
+                    Text {
+                      id: tabText
+                      width: parent.width - (parent.canDiscard ? Style.space(24) : 0)
+                      text: parent.isHeader ? ("▾ " + parent.modelData.title)
+                            : (parent.isTab
+                               ? ((parent.modelData.active ? "▸ " : "· ")
+                                  + (parent.modelData.title || parent.modelData.url || "")
+                                  + (parent.modelData.discarded ? qsTr("  (durmiendo)") : ""))
+                               : "▸ " + parent.modelData.title)
+                      color: parent.isHeader || (parent.isTab && parent.modelData.active)
+                             ? Qt.darker(Color.popups.text, 1.05)
+                             : Qt.darker(Color.popups.text, 1.15)
+                      opacity: parent.isTab && !parent.modelData.active ? 0.75 : 1.0
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                      elide: Text.ElideRight
+                    }
+                    RowBtn {
+                      visible: parent.canDiscard
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      scale: 0.75
+                      glyph: "⏏"
+                      onClicked: root.tabDiscard(parent.modelData.id)
+                    }
                   }
                 }
 

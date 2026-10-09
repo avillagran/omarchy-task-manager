@@ -1568,42 +1568,106 @@ fn cmd_follow() {
 }
 
 /// Native Messaging host for the companion "Omarchy Task Manager Tabs"
-/// extension. Chrome spawns one host process per message: read one framed
-/// message (4-byte LE length + JSON), persist the tab list atomically
-/// (user-only, 0600), reply {"ok":true}, exit.
+/// extension (long-lived port mode, connectNative): reads framed tab reports
+/// from stdin and persists them atomically (user-only, 0600), and forwards
+/// local commands (written by `tabs-cmd`) back to the extension over stdout.
+/// Chrome keeps this process alive for the browser session.
 fn cmd_tabs_host() {
-    use std::io::{Read, Write};
-    let stdin = std::io::stdin();
-    let mut len = [0u8; 4];
-    if stdin.lock().read_exact(&mut len).is_err() {
-        std::process::exit(1);
-    }
-    let n = u32::from_le_bytes(len) as usize;
-    if n == 0 || n > 4 * 1024 * 1024 {
-        std::process::exit(1);
-    }
-    let mut buf = vec![0u8; n];
-    if stdin.lock().read_exact(&mut buf).is_err() {
-        std::process::exit(1);
-    }
-    let Ok(v) = serde_json::from_slice::<Value>(&buf) else {
-        std::process::exit(1);
-    };
-    let Some(tabs) = v.get("tabs").and_then(|t| t.as_array()) else {
-        std::process::exit(1);
-    };
+    use std::io::Read;
     let Some(home) = env::var_os("HOME") else {
         std::process::exit(1);
     };
     let dir = Path::new(&home).join(".cache/omarchy/task-manager");
     let _ = fs::create_dir_all(&dir);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let out = serde_json::json!({ "updatedAt": now, "tabs": tabs }).to_string();
-    let tmp = dir.join(format!("tabs.json.{}", std::process::id()));
-    let dst = dir.join("tabs.json");
+    let cmd_path = dir.join("tabs-cmd.json");
+    let cache = dir.join("tabs.json");
+
+    // Writer thread: poll the command file, forward each command to the
+    // extension (framed), and remove it once sent.
+    let cmd_tx;
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    cmd_tx = tx;
+    std::thread::spawn(move || loop {
+        if let Ok(text) = fs::read_to_string(&cmd_path) {
+            if serde_json::from_str::<Value>(&text).is_ok() {
+                let _ = cmd_tx.send(text);
+                let _ = fs::remove_file(&cmd_path);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    });
+
+    let stdout = std::io::stdout();
+    std::thread::spawn(move || {
+        use std::io::Write as _;
+        while let Ok(cmd) = rx.recv() {
+            let mut out = stdout.lock();
+            let _ = out.write_all(&(cmd.len() as u32).to_le_bytes());
+            let _ = out.write_all(cmd.as_bytes());
+            let _ = out.flush();
+        }
+    });
+
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    loop {
+        let mut len = [0u8; 4];
+        if input.read_exact(&mut len).is_err() {
+            break; // browser closed the port
+        }
+        let n = u32::from_le_bytes(len) as usize;
+        if n == 0 || n > 4 * 1024 * 1024 {
+            break;
+        }
+        let mut buf = vec![0u8; n];
+        if input.read_exact(&mut buf).is_err() {
+            break;
+        }
+        let Ok(v) = serde_json::from_slice::<Value>(&buf) else {
+            continue;
+        };
+        let Some(tabs) = v.get("tabs").and_then(|t| t.as_array()) else {
+            continue;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let out = serde_json::json!({ "updatedAt": now, "tabs": tabs }).to_string();
+        let tmp = dir.join(format!("tabs.json.{}", std::process::id()));
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Ok(mut f) = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+            {
+                use std::io::Write as _;
+                if f.write_all(out.as_bytes()).is_ok() {
+                    let _ = fs::rename(&tmp, &cache);
+                }
+            }
+        }
+    }
+}
+
+/// Queue a command for the browser extension (e.g. `tabs-cmd discard 123`).
+/// The long-lived tabs host forwards it to the extension within ~0.5s.
+fn cmd_tabs_cmd(action: &str, id: &str) {
+    let tab_id: u64 = id.parse().unwrap_or_else(|_| usage());
+    if action != "discard" {
+        usage();
+    }
+    let Some(home) = env::var_os("HOME") else {
+        std::process::exit(1);
+    };
+    let dir = Path::new(&home).join(".cache/omarchy/task-manager");
+    let _ = fs::create_dir_all(&dir);
+    let out = serde_json::json!({ "action": action, "tabId": tab_id }).to_string();
+    let tmp = dir.join(format!("tabs-cmd.json.{}", std::process::id()));
+    let dst = dir.join("tabs-cmd.json");
     {
         use std::os::unix::fs::OpenOptionsExt;
         if let Ok(mut f) = fs::OpenOptions::new()
@@ -1619,11 +1683,6 @@ fn cmd_tabs_host() {
             }
         }
     }
-    let reply = b"{\"ok\":true}";
-    let mut stdout = std::io::stdout().lock();
-    let _ = stdout.write_all(&(reply.len() as u32).to_le_bytes());
-    let _ = stdout.write_all(reply);
-    let _ = stdout.flush();
 }
 
 /// Browser comms that consume the tabs cache.
@@ -1681,6 +1740,7 @@ fn main() {
         "watch" => cmd_watch(),
         "follow" => cmd_follow(),
         "tabs-host" => cmd_tabs_host(),
+        "tabs-cmd" if args.len() == 4 => cmd_tabs_cmd(&args[2], &args[3]),
         "history" => cmd_history(),
         "procs" if args.len() == 3 => cmd_procs(args[2].parse().unwrap_or_else(|_| usage())),
         "pref" if args.len() == 4 => cmd_pref(&args[2], &args[3]),
