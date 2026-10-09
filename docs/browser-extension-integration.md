@@ -39,20 +39,23 @@ MV3 extension + Native Messaging host, all user-scoped:
 ## What an extension can give the task manager
 
 - `chrome.tabs.query({})` → every tab in every window: `id, windowId,
-  title, url, active, groupId`. Grouped by `windowId` this yields the full
-  tab list per Chrome window (today we only have the ACTIVE tab per window,
-  from Hyprland's window title).
-- `chrome.processes.getProcessInfo()` → tab↔process mapping, but with
-  Chrome-INTERNAL process ids, not OS pids. **Mapping a row in the
-  subprocess list to a specific tab remains impossible.** The honest UX is:
-  window titles + full tab list per browser window, plus role labels
-  (renderer/gpu/network) for OS subprocesses.
-- A minimal "Task Manager Tabs" extension would be ~40 lines: on tab
-  events (created/removed/updated/activated/moved) send the full
-  `chrome.tabs.query` result to a native host
-  `io.github.avillagran.taskmanager`, which writes
-  `~/.cache/omarchy/task-manager/tabs.json`; the Rust helper merges it into
-  `state` (per chrome-family app: `tabs: [...]`).
+  title, url, active, discarded, audible, status, groupId`. Grouped by
+  `windowId` this yields the full tab list per Chrome window, with a
+  per-tab **discard** action (unload = free its memory, reload on focus).
+- **Renderer↔tab mapping is definitively impossible** (verified
+  2026-10-09, Chrome 154 stable):
+  - OS side: renderer cmdlines carry only `--renderer-client-id=N`
+    (Chrome-internal counter), zero tab identity; thread names are generic.
+  - `chrome.processes` (per-process privateMemory + task list) is
+    dev-channel-only (`_permission_features.json`: `"channel": "dev"`,
+    beta allowlist limited to two Google-owned extension ids).
+  - CDP `SystemInfo.getProcessInfo` WOULD map OS pids↔targets, but Chrome
+    ≥136 refuses `--remote-debugging-port` on the default profile.
+  - `chrome.debugger` attaches per-tab only; browser-level domains
+    (SystemInfo) are not reachable through a tab target.
+  - Consequence: show tabs (with identity + discard action) and processes
+    (role-ordered, busy renderers highlighted via state `R`) as two
+    honest sections — never fake a 1:1 mapping.
 
 ## Extension installation paths on Linux (trade-offs)
 

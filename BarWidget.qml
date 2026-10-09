@@ -1863,6 +1863,8 @@ BarWidget {
                             : (parent.isTab
                                ? ((parent.modelData.active ? "▸ " : "· ")
                                   + (parent.modelData.title || parent.modelData.url || "")
+                                  + (parent.modelData.audible ? " ♪" : "")
+                                  + (parent.modelData.loading ? " …" : "")
                                   + (parent.modelData.discarded ? qsTr("  (durmiendo)") : ""))
                                : "▸ " + parent.modelData.title)
                       color: parent.isHeader || (parent.isTab && parent.modelData.active)
@@ -1922,10 +1924,11 @@ BarWidget {
                         text: proc.state
                         color: proc.state === "T" ? Color.accent
                                : (proc.state === "Z" ? "#ff3b30"
-                               : Qt.darker(Color.popups.text, 1.6))
+                               : (proc.state === "R" ? "#f5c211"
+                               : Qt.darker(Color.popups.text, 1.6)))
                         font.family: root.iconFont
                         font.pixelSize: Style.font.caption
-                        font.bold: proc.state === "T" || proc.state === "Z"
+                        font.bold: proc.state === "T" || proc.state === "Z" || proc.state === "R"
                       }
                       Text {
                         text: proc.rss_mb + " MB"

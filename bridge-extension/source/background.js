@@ -29,6 +29,8 @@ async function report() {
       url: t.url || "",
       active: !!t.active,
       discarded: !!t.discarded,
+      audible: !!t.audible,
+      loading: t.status === "loading",
       group: t.groupId
     }));
     if (port) port.postMessage({ tabs: slim });
