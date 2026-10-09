@@ -69,13 +69,22 @@ MV3 extension + Native Messaging host, all user-scoped:
    be sealed/pinned (mailbox has a polished pkexec + sealed-memfd
    prototype). This privileged surface is EXACTLY what stalls marketplace
    review (see below).
-4. **Chrome Web Store, unlisted (recommended)** — upload the extension zip
-   once; the listing stays unlisted. The plugin's "Install in browser"
-   button just opens the CWS URL. One click, auto-updates, works in
-   Chrome/Brave/Edge. The extension ID is preserved because the manifest
-   already carries its `key`. The plugin then contains ZERO privileged
-   code — nothing for the marketplace scanner to escalate. Google's CWS
-   review is a separate, standard gate and does not involve Omarchy.
+4. **Chrome Web Store, unlisted** — one click, auto-updates, ID preserved
+   via `manifest.key`. Needs a Google developer account (registration
+   blocked for the maintainer — not usable).
+5. **Self-hosted external CRX (what task-manager ships)** — pack the CRX
+   locally (`google-chrome-stable --pack-extension=source
+   --pack-extension-key=key.pem`), publish it plus an `update.xml`
+   manifest as GitHub release assets, and register
+   `/opt/google/chrome/extensions/<id>.json` containing
+   `{"external_update_url": "…/update.xml"}` (single sudo write).
+   Chrome auto-installs on next start and auto-updates on every release.
+   Linux-only (Windows/macOS dropped off-store external installs in
+   Chrome 33). Marketplace impact: the plugin tree carries no privileged
+   helper — the sudo write is one auditable command the USER runs from
+   the README/`bridge-install.sh auto`, not a pkexec path inside the
+   plugin's QML, so the scanner's privilege capability is not triggered
+   the way mailbox's Panel.qml buttons trigger it.
 
 ## Mailbox marketplace status (measured 2026-10-06)
 

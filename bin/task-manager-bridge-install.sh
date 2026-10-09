@@ -67,6 +67,26 @@ case "${1:-install}" in
     echo "native host registered (user scope). Load the extension once:"
     echo "  chrome://extensions → Developer mode → Load unpacked → $SELF_DIR/../bridge-extension/source"
     ;;
+  # One-command auto-install WITHOUT the Chrome Web Store: writes a
+  # system external-extension entry pointing at the self-hosted update
+  # manifest (GitHub release). Chrome installs and auto-updates the CRX
+  # from there on next start. This is the ONLY root-requiring step and it
+  # is a single auditable file write; everything else is user-scoped.
+  auto)
+    json='{ "external_update_url": "https://github.com/avillagran/omarchy-task-manager/releases/download/tabs-bridge-v0.1.0/update.xml" }'
+    target="/opt/google/chrome/extensions/$EXT_ID.json"
+    if [ -f "$target" ]; then
+      echo "already installed: $target"
+      exit 0
+    fi
+    echo "$json" | sudo install -m 0644 /dev/stdin "$target" \
+      && echo "installed: $target — restart Chrome once; the extension self-installs and auto-updates." \
+      || { echo "sudo refused; fall back to Load unpacked (see: $0 install)" >&2; exit 1; }
+    ;;
+  auto-uninstall)
+    target="/opt/google/chrome/extensions/$EXT_ID.json"
+    [ -f "$target" ] && sudo rm -f "$target" && echo "removed: $target" || echo "not installed"
+    ;;
   uninstall)
     for d in $(browser_dirs); do
       if [ -f "$d/$HOST_NAME.json" ]; then
@@ -81,5 +101,5 @@ case "${1:-install}" in
       [ -f "$d/$HOST_NAME.json" ] && echo "registered: $d/$HOST_NAME.json"
     done
     ;;
-  *) echo "usage: $0 [install|uninstall|status]" >&2; exit 1 ;;
+  *) echo "usage: $0 [install|auto|auto-uninstall|uninstall|status]" >&2; exit 1 ;;
 esac

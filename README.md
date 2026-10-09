@@ -85,9 +85,17 @@ companion extension, over Chrome's Native Messaging, 100% local:
 - `install.sh` registers the native host **user-scoped** (no root) for
   every browser profile dir it finds. Safe to re-run; unregistered by
   `install.sh --uninstall`.
-- Load the extension once: `chrome://extensions` → Developer mode →
-  **Load unpacked** → `bridge-extension/source`. From then on the expanded
-  browser row shows all tabs (active marked ▸), refreshing live.
+- Load the extension once, either way:
+  - **Direct (no store, no developer account):**
+    `bin/task-manager-bridge-install.sh auto` writes ONE system file
+    (`/opt/google/chrome/extensions/<id>.json`, via sudo) pointing at the
+    self-hosted update manifest on GitHub Releases. Restart Chrome once —
+    the extension installs itself and auto-updates on every release.
+    `auto-uninstall` removes it.
+  - **Fully rootless:** `chrome://extensions` → Developer mode →
+    **Load unpacked** → `bridge-extension/source`.
+  From then on the expanded browser row shows all tabs (active marked ▸),
+  refreshing live.
 - The extension is read-only (permissions: `tabs` + `nativeMessaging`),
   never touches page content, and writes only to
   `~/.cache/omarchy/task-manager/tabs.json` (mode 0600).
