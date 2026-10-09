@@ -1172,7 +1172,11 @@ fn now_from_history() -> Option<(f32, f32)> {
 /// background scope-mates appear inside the app's tree.
 fn cmd_procs(pid: u64) {
     let members = comm_family(pid);
-    let mut rows: Vec<(u64, String, u64, String)> = members
+    // Hierarchy beats raw size: the browser main process first, then
+    // renderers by RSS (the actual tab cost), then service roles, with
+    // zygote/crashpad anchors last. Processes with no role (every non-Chromium
+    // app) share rank 1 and stay purely RSS-ordered, as before.
+    let mut rows: Vec<(u64, String, u64, String, String)> = members
         .iter()
         .map(|p| {
             let state = fs::read_to_string(format!("/proc/{p}/stat"))
@@ -1180,18 +1184,31 @@ fn cmd_procs(pid: u64) {
                 .and_then(|t| t.rfind(')').map(|rp| t[rp + 2..].to_string()))
                 .and_then(|rest| rest.chars().next().map(|c| c.to_string()))
                 .unwrap_or_else(|| "?".into());
-            (*p, comm(*p), rss_kb(*p) / 1024, state)
+            (*p, comm(*p), rss_kb(*p) / 1024, state, if *p == pid { "browser".to_string() } else { proc_role(*p) })
         })
         .collect();
-    rows.sort_by(|a, b| b.2.cmp(&a.2));
+    fn role_rank(r: &str) -> u8 {
+        match r {
+            "browser" => 0,
+            "renderer" => 1,
+            "gpu" => 2,
+            "network" => 3,
+            "audio" => 4,
+            "utility" | "storage" => 5,
+            "zygote" => 6,
+            "crashpad" => 7,
+            _ => 1, // unknown roles sort with renderers, sized
+        }
+    }
+    rows.sort_by(|a, b| role_rank(&a.4).cmp(&role_rank(&b.4)).then(b.2.cmp(&a.2)));
     rows.truncate(40);
     let json: Vec<String> = rows
         .iter()
-        .map(|(p, c, r, s)| {
+        .map(|(p, c, r, s, role)| {
             format!(
                 "{{\"pid\":{p},\"comm\":\"{}\",\"role\":\"{}\",\"rss_mb\":{r},\"state\":\"{s}\"}}",
                 json_escape(c),
-                json_escape(&proc_role(*p))
+                json_escape(role)
             )
         })
         .collect();

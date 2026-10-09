@@ -338,6 +338,41 @@ BarWidget {
     root.runProcs(pid)
   }
 
+  // Group live browser tabs by their chrome window: one header row per
+  // window (its active tab's title — that is what Hyprland shows), then the
+  // window's tabs in their real order. Window groups follow the compositor's
+  // window order where the active-tab title matches a window title.
+  function tabGroups(app) {
+    var tabs = app.tabs || []
+    if (!tabs.length) return []
+    var byWin = {}, order = []
+    for (var i = 0; i < tabs.length; i++) {
+      var w = tabs[i].win
+      if (!(w in byWin)) { byWin[w] = []; order.push(w) }
+      byWin[w].push(tabs[i])
+    }
+    var wins = app.wins || []
+    var ranked = []
+    for (var k = 0; k < wins.length; k++) {
+      var wt = (wins[k].title || "").replace(/ - (Google Chrome|Chromium|Brave( Software)?)$/, "")
+      for (var j = 0; j < order.length; j++) {
+        var act = byWin[order[j]].filter(function(t) { return t.active })[0]
+        if (act && act.title && (act.title === wt || wt.indexOf(act.title) === 0 || act.title.indexOf(wt) === 0)) {
+          ranked.push(order.splice(j, 1)[0]); break
+        }
+      }
+    }
+    order = ranked.concat(order)
+    var rows = []
+    for (var m = 0; m < order.length; m++) {
+      var grp = byWin[order[m]]
+      var active = grp.filter(function(t) { return t.active })[0]
+      rows.push({ header: true, title: active ? active.title : (grp[0].title || "") })
+      for (var q = 0; q < grp.length; q++) rows.push(grp[q])
+    }
+    return rows
+  }
+
   function toggleExpand(pid) {
     var e = root.expandedProcs
     e[pid] = !e[pid]
@@ -1798,21 +1833,24 @@ BarWidget {
                 Repeater {
                   model: root.expandedProcs[app.pid]
                          ? ((app.tabs && app.tabs.length)
-                            ? app.tabs
+                            ? root.tabGroups(app)
                             : (app.wins || []).filter(function(w) { return w.title && w.title !== "" }))
                          : []
                   Text {
                     required property var modelData
-                    // tab objects carry .active; window objects do not
+                    // header rows = window groups; tab objects carry .active;
+                    // bare window objects (fallback) have neither
+                    readonly property bool isHeader: modelData.header === true
                     readonly property bool isTab: modelData.active !== undefined
-                    text: (isTab ? (modelData.active ? "▸ " : "· ") : "▸ ")
-                          + (modelData.title || modelData.url || "")
-                    color: isTab && modelData.active
+                    text: isHeader ? ("▾ " + modelData.title)
+                          : (isTab ? (modelData.active ? "▸ " : "· ") : "▸ ")
+                            + (modelData.title || modelData.url || "")
+                    color: isHeader || (isTab && modelData.active)
                            ? Qt.darker(Color.popups.text, 1.05)
                            : Qt.darker(Color.popups.text, 1.15)
                     opacity: isTab && !modelData.active ? 0.75 : 1.0
                     width: parent.width - Style.space(20)
-                    x: Style.space(20)
+                    x: isHeader ? Style.space(20) : Style.space(32)
                     font.family: Style.font.family
                     font.pixelSize: Style.font.caption
                     elide: Text.ElideRight
