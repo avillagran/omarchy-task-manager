@@ -104,6 +104,7 @@ BarWidget {
   property real cpuNow: 0.0
   property real memNow: 0.0
   property var expandedProcs: ({})
+  property var suggestions: []
   property var procsRaw: ({})
   property var procsData: ({})
   property var procsQueue: []
@@ -474,6 +475,7 @@ BarWidget {
       }
       if (data.pressure) root.pressureCritical = !!data.pressure.critical
       root.background = data.background || []
+      root.suggestions = data.suggestions || []
       root.prefs = data.prefs || {}
       if (data.now) {
         root.cpuNow = data.now.cpu || 0.0
@@ -518,6 +520,12 @@ BarWidget {
   // the extension, chrome.tabs.discard does the rest.
   function tabDiscard(tabId) {
     Quickshell.execDetached([root.binPath, "tabs-cmd", "discard", String(tabId)])
+    settleTimer.restart()
+  }
+
+  // Discard every background tab in one go (suggestion action).
+  function tabDiscardAll() {
+    Quickshell.execDetached([root.binPath, "tabs-cmd", "discard-background", "0"])
     settleTimer.restart()
   }
 
@@ -1687,6 +1695,47 @@ BarWidget {
           }
         }
 
+        // Suggestions: evidence-based actions from the helper (sleepers in
+        // swap, discardable background tabs, high pressure).
+        Repeater {
+          model: root.prefsOpen ? [] : root.suggestions
+          Rectangle {
+            required property var modelData
+            width: listFlick.width
+            height: sugRow.implicitHeight + Style.space(8)
+            radius: Style.cornerRadius - 2
+            color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.08)
+            border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.25)
+            border.width: 1
+            RowLayout {
+              id: sugRow
+              width: parent.width - Style.space(16)
+              anchors.centerIn: parent
+              spacing: Style.space(8)
+              Text {
+                Layout.fillWidth: true
+                text: "💡 " + modelData.text
+                color: Color.popups.text
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+              RowBtn {
+                visible: modelData.action === "kill"
+                glyph: "\uDB80\uDD56"
+                danger: true
+                onClicked: root.action("kill", modelData.pid)
+              }
+              RowBtn {
+                visible: modelData.action === "discard-bg"
+                glyph: "⏏"
+                accent: true
+                onClicked: root.tabDiscardAll()
+              }
+            }
+          }
+        }
+
         // The list FLEXES: it absorbs leftover card space, so the Activity
         // section and footer pin to the bottom with no dead space.
         // A ListView (not Flickable+Repeater): delegates update IN PLACE
@@ -2004,6 +2053,7 @@ BarWidget {
                   Text {
                     text: (bg.procs > 1 ? bg.procs + " " + root.tr("procs") + " · " : "")
                           + bg.rss_mb + " MB"
+                          + (bg.swap_mb > 0 ? "  ·  ⤓ " + bg.swap_mb + " MB" : "")
                     color: Qt.darker(Color.popups.text, 1.4)
                     font.family: Style.font.family
                     font.pixelSize: Style.font.caption

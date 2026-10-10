@@ -564,11 +564,23 @@ fn family_scopes(family: &[u64]) -> Vec<(String, String)> {
 struct BgRec {
     name: String,
     rss_mb: u64,
+    swap_mb: u64,
     procs: usize,
     pid: u64, // biggest pid of the group (representative for actions)
     unit: String,
     mechanism: &'static str,
     frozen: bool,
+}
+
+/// Per-process swap usage (VmSwap, kB) — cheap status read.
+fn swap_kb(pid: u64) -> u64 {
+    let Ok(s) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return 0;
+    };
+    s.lines()
+        .find_map(|l| l.strip_prefix("VmSwap:"))
+        .and_then(|v| v.trim().trim_end_matches(" kB").parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 fn collect_background(by_pid: &BTreeMap<u64, Vec<Win>>, marks: &[u64]) -> Vec<BgRec> {
@@ -582,7 +594,7 @@ fn collect_background(by_pid: &BTreeMap<u64, Vec<Win>>, marks: &[u64]) -> Vec<Bg
         .map(|p| comm(*p))
         .filter(|c| !EXCLUDE_COMMS.contains(&c.as_str()))
         .collect();
-    let mut groups: BTreeMap<String, (u64, Vec<u64>)> = BTreeMap::new();
+    let mut groups: BTreeMap<String, (u64, u64, Vec<u64>)> = BTreeMap::new();
     let Ok(entries) = fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -604,14 +616,15 @@ fn collect_background(by_pid: &BTreeMap<u64, Vec<Win>>, marks: &[u64]) -> Vec<Bg
             continue;
         }
         let r = rss_kb(pid);
-        let g = groups.entry(c).or_insert((0, Vec::new()));
+        let g = groups.entry(c).or_insert((0, 0, Vec::new()));
         g.0 += r;
-        g.1.push(pid);
+        g.1 += swap_kb(pid);
+        g.2.push(pid);
     }
     let our_units = marker_units();
     let mut out: Vec<BgRec> = groups
         .into_iter()
-        .filter_map(|(name, (rkb, pids))| {
+        .filter_map(|(name, (rkb, skb, pids))| {
             let biggest = pids
                 .iter()
                 .max_by_key(|p| rss_kb(**p))
@@ -629,13 +642,16 @@ fn collect_background(by_pid: &BTreeMap<u64, Vec<Win>>, marks: &[u64]) -> Vec<Bg
                 ),
             };
             // Floor applies only to running rows: a frozen app's RSS can be
-            // squeezed to near zero and the row must NOT vanish.
-            if rkb < MIN_BG_RSS_KB && !frozen {
+            // squeezed to near zero and the row must NOT vanish. The floor
+            // weighs rss+swap TOGETHER so a fully-swapped sleeper (tiny RSS,
+            // hundreds of MB in swap — the classic idle server) still lists.
+            if rkb + skb < MIN_BG_RSS_KB && !frozen {
                 return None;
             }
             Some(BgRec {
                 name,
                 rss_mb: rkb / 1024,
+                swap_mb: skb / 1024,
                 procs: pids.len(),
                 pid: biggest,
                 unit,
@@ -644,8 +660,8 @@ fn collect_background(by_pid: &BTreeMap<u64, Vec<Win>>, marks: &[u64]) -> Vec<Bg
             })
         })
         .collect();
-    out.sort_by(|a, b| b.rss_mb.cmp(&a.rss_mb));
-    out.truncate(12);
+    out.sort_by(|a, b| (b.rss_mb + b.swap_mb).cmp(&(a.rss_mb + a.swap_mb)));
+    out.truncate(40);
     out
 }
 
@@ -699,6 +715,7 @@ fn collect_system(by_pid: &BTreeMap<u64, Vec<Win>>) -> Vec<BgRec> {
         .map(|(name, (rkb, pids))| BgRec {
             name,
             rss_mb: rkb / 1024,
+            swap_mb: 0, // system daemons: informational only, no swap tally
             procs: pids.len(),
             pid: pids.iter().copied().max().unwrap_or(0),
             unit: String::new(),
@@ -795,10 +812,11 @@ fn cmd_state() {
         }
         first = false;
         bg_json.push_str(&format!(
-            "{{\"pid\":{},\"name\":\"{}\",\"rss_mb\":{},\"procs\":{},\"unit\":\"{}\",\"mechanism\":\"{}\",\"frozen\":{}}}",
+            "{{\"pid\":{},\"name\":\"{}\",\"rss_mb\":{},\"swap_mb\":{},\"procs\":{},\"unit\":\"{}\",\"mechanism\":\"{}\",\"frozen\":{}}}",
             b.pid,
             json_escape(&b.name),
             b.rss_mb,
+            b.swap_mb,
             b.procs,
             json_escape(&b.unit),
             b.mechanism,
@@ -844,8 +862,48 @@ fn cmd_state() {
         None => "null".to_string(),
     };
     let prefs = read_prefs();
+
+    // Suggestions: evidence-based, each with an optional one-click action.
+    let mut sug: Vec<String> = Vec::new();
+    for b in &background {
+        // Fully-swapped sleeper: the idle-llama-server pattern. Tiny RSS,
+        // big swap — closing it returns the swap immediately.
+        if !b.frozen && b.swap_mb >= 200 && b.rss_mb <= 100 {
+            sug.push(format!(
+                "{{\"kind\":\"sleeper\",\"text\":\"{} lleva {} MB dormido en swap — cerrarlo libera esa memoria\",\"action\":\"kill\",\"pid\":{}}}",
+                json_escape(&b.name),
+                b.swap_mb,
+                b.pid
+            ));
+        }
+    }
+    // Browser tabs: many idle background tabs → one-click discard-all.
+    let tabs_raw = tabs_cache_json();
+    if let Ok(v) = serde_json::from_str::<Value>(&tabs_raw) {
+        if let Some(tabs) = v.as_array() {
+            let idle = tabs
+                .iter()
+                .filter(|t| {
+                    t.get("active").and_then(|a| a.as_bool()) == Some(false)
+                        && t.get("discarded").and_then(|d| d.as_bool()) == Some(false)
+                })
+                .count();
+            if idle >= 8 {
+                sug.push(format!(
+                    "{{\"kind\":\"tabs\",\"text\":\"{} pestañas en segundo plano — descargarlas libera su memoria (recargan al enfocarlas)\",\"action\":\"discard-bg\",\"pid\":0}}",
+                    idle
+                ));
+            }
+        }
+    }
+    if avail_pct < 25.0 {
+        sug.push(
+            "{\"kind\":\"pressure\",\"text\":\"Presión de memoria alta — pausa las apps que no estés usando\",\"action\":\"none\",\"pid\":0}".to_string(),
+        );
+    }
+    let sug_json = format!("\"suggestions\":[{}]", sug.join(","));
     println!(
-        "{{\"mem\":{{\"total_mb\":{total},\"avail_mb\":{avail},\"psi_some10\":{psi:.2},\"swap_total_mb\":{swap_total},\"swap_used_mb\":{swap_used}}},\"pressure\":{{\"avail_pct\":{avail_pct:.1},\"critical\":{critical}}},\"zswap\":{{\"available\":{zswap_avail},\"enabled\":{zswap_on},\"zram\":{zram_backed}}},\"now\":{now_json},\"prefs\":{prefs},\"monitors\":[{}],{out},{bg_json},{sys_json}}}",
+        "{{\"mem\":{{\"total_mb\":{total},\"avail_mb\":{avail},\"psi_some10\":{psi:.2},\"swap_total_mb\":{swap_total},\"swap_used_mb\":{swap_used}}},\"pressure\":{{\"avail_pct\":{avail_pct:.1},\"critical\":{critical}}},\"zswap\":{{\"available\":{zswap_avail},\"enabled\":{zswap_on},\"zram\":{zram_backed}}},\"now\":{now_json},\"prefs\":{prefs},\"monitors\":[{}],{out},{bg_json},{sys_json},{sug_json}}}",
         mons_json.join(",")
     );
 }
@@ -1629,6 +1687,18 @@ fn cmd_tabs_host() {
         let Some(tabs) = v.get("tabs").and_then(|t| t.as_array()) else {
             continue;
         };
+        // ACK every message: port-mode extensions ignore it, but a one-shot
+        // sendNativeMessage caller (extension ≤0.1.x) holds stdin open until
+        // a reply arrives — without this ack the host loops forever per
+        // one-shot message and leaks one process per tab event.
+        {
+            use std::io::Write as _;
+            let ack = b"{\"ok\":true}";
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(&(ack.len() as u32).to_le_bytes());
+            let _ = out.write_all(ack);
+            let _ = out.flush();
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -1657,7 +1727,7 @@ fn cmd_tabs_host() {
 /// The long-lived tabs host forwards it to the extension within ~0.5s.
 fn cmd_tabs_cmd(action: &str, id: &str) {
     let tab_id: u64 = id.parse().unwrap_or_else(|_| usage());
-    if action != "discard" {
+    if action != "discard" && action != "discard-background" {
         usage();
     }
     let Some(home) = env::var_os("HOME") else {

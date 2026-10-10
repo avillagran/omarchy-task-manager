@@ -14,6 +14,14 @@ function connect() {
     if (msg && msg.action === "discard" && typeof msg.tabId === "number") {
       try { await chrome.tabs.discard(msg.tabId); } catch (_) {}
       report();
+    } else if (msg && msg.action === "discard-background") {
+      try {
+        const tabs = await chrome.tabs.query({ active: false, discarded: false });
+        for (const t of tabs) {
+          try { await chrome.tabs.discard(t.id); } catch (_) {}
+        }
+      } catch (_) {}
+      report();
     }
   });
   port.onDisconnect.addListener(() => { port = null; setTimeout(connect, 5000); });
