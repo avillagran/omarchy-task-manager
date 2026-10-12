@@ -1389,8 +1389,9 @@ fn focused_pid() -> Option<u64> {
 }
 
 /// Biggest freezable candidate: windowed app or background scope, never the
-/// focused app, never already-frozen, >= MIN_FREEZE_MB.
-fn freeze_biggest() -> Option<String> {
+/// focused app, never already-frozen, never in `skip` (per-app cooldown),
+/// >= MIN_FREEZE_MB.
+fn freeze_biggest(skip: &std::collections::BTreeSet<String>) -> Option<String> {
     let mons = monitors();
     let mut by_pid: BTreeMap<u64, Vec<Win>> = BTreeMap::new();
     for w in clients(&mons) {
@@ -1403,6 +1404,9 @@ fn freeze_biggest() -> Option<String> {
     let mut best: Option<(u64, String, u64)> = None; // (pid, name, rss_mb)
     let mut consider = |pid: u64, name: String, rss_kb: u64, unit: String, frozen: bool| {
         if frozen || rss_kb < MIN_FREEZE_MB * 1024 {
+            return;
+        }
+        if skip.contains(&name) {
             return;
         }
         if Some(pid) == focus {
@@ -1589,19 +1593,14 @@ fn cmd_watch() {
             && frozen_this_episode < max_freeze_per_episode()
             && no_candidates_since.is_none()
         {
-            let on_cooldown = |what: &str| -> bool {
-                let name = what.split(" (").next().unwrap_or(what);
-                last_frozen
-                    .get(name)
-                    .map(|t| t.elapsed() < std::time::Duration::from_secs(600))
-                    .unwrap_or(false)
-            };
-            match freeze_biggest() {
-                Some(what) if on_cooldown(&what) => {
-                    eprintln!("watch: pressure critical but {what} froze <10min ago — skip");
-                    hits = 0;
-                    std::thread::sleep(std::time::Duration::from_millis(5000));
-                }
+            // Cooldown names are excluded INSIDE the picker so a cooling-down
+            // biggest app (Chrome) doesn't starve the next candidate.
+            let skip: std::collections::BTreeSet<String> = last_frozen
+                .iter()
+                .filter(|(_, t)| t.elapsed() < std::time::Duration::from_secs(600))
+                .map(|(n, _)| n.clone())
+                .collect();
+            match freeze_biggest(&skip) {
                 Some(what) => {
                     eprintln!(
                         "watch: pressure critical ({pct:.1}% avail, psi_some {psi_some:.1}, psi_full {psi_full:.1}, cpu {cpu_now:.0}%/{cpu_max:.0}) — froze {what}"
