@@ -443,6 +443,15 @@ BarWidget {
       root.reconcileApps(arr)  // view model: delegates update IN PLACE
       root.system = data.system || []
       root.monitors = data.monitors || []
+      // Workspaces currently shown on some monitor. A frozen window on a
+      // HIDDEN workspace (scratchpad/special, another ws) must not get a
+      // veil: there is nothing visible to cover, and the veil would map at
+      // stale coords (screen center flash) or linger under the window when
+      // it comes back. When the window returns to a visible ws, the scan
+      // recreates the veil — a fresh map, so it lands ON TOP again.
+      var activeWs = {}
+      for (var mi = 0; mi < root.monitors.length; mi++)
+        activeWs[root.monitors[mi].active_ws] = true
       var n = 0
       var fw = []
       for (var i = 0; i < root.apps.length; i++) {
@@ -452,6 +461,8 @@ BarWidget {
           var wins = a.wins || []
           for (var j = 0; j < wins.length; j++) {
             var w = wins[j]
+            if (!w.pinned && !activeWs[w.ws])
+              continue
             fw.push({
               "addr": w.addr, "x": w.x, "y": w.y, "w": w.w, "h": w.h,
               "ws": w.ws, "mon": w.mon, "pinned": w.pinned,
@@ -461,7 +472,10 @@ BarWidget {
         }
       }
       root.frozenCount = n
-      root.frozenWins = fw
+      // Assign only on real change: Variants rebuilds delegates when the
+      // array identity flips, which would strobe every veil on each scan.
+      if (JSON.stringify(fw) !== JSON.stringify(root.frozenWins))
+        root.frozenWins = fw
       if (data.mem) {
         root.memAvailMb = data.mem.avail_mb || 0
         root.memTotalMb = data.mem.total_mb || 0
@@ -1182,7 +1196,12 @@ BarWidget {
           }
         } else {
           if (!veilSyncProc.running) veilSyncProc.running = true
-          if (data.startsWith("closewindow>>") && !scanProc.running)
+          // Workspace transitions change veil VISIBILITY (a frozen window
+          // leaving/entering a visible workspace), not just geometry — the
+          // scan rebuilds frozenWins fast instead of waiting 3s.
+          if ((data.startsWith("closewindow>>") || data.startsWith("movewindowv2>>")
+               || data.startsWith("workspace>>") || data.startsWith("openwindow>>"))
+              && !scanProc.running)
             scanProc.running = true
         }
       }
