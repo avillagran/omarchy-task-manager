@@ -56,5 +56,9 @@ chrome.windows.onCreated.addListener(report);
 chrome.windows.onRemoved.addListener(report);
 chrome.runtime.onStartup.addListener(report);
 chrome.runtime.onInstalled.addListener(report);
+// Heartbeat: MV3 workers suspend and idle browsers fire no tab events —
+// without this the tab list goes stale after 2 quiet minutes.
+chrome.alarms.create("tm-heartbeat", { periodInMinutes: 1 });
+chrome.alarms.onAlarm.addListener(report);
 connect();
 report();

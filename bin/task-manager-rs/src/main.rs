@@ -386,7 +386,11 @@ fn crit_cpu_pct() -> f64 {
         }
     }
     let n = pref_num("watchMaxCpu", 0.0);
-    if n <= 0.0 { 0.0 } else { n.clamp(50.0, 99.0) }
+    if n <= 0.0 {
+        0.0
+    } else {
+        n.clamp(50.0, 99.0)
+    }
 }
 fn recover_avail_pct() -> f64 {
     env::var("TM_RECOVER_AVAIL_PCT")
@@ -402,17 +406,28 @@ fn max_freeze_per_episode() -> u32 {
 }
 
 /// (avail_pct, critical)
-fn pressure(total: u64, avail: u64, psi: f64) -> (f64, bool) {
+fn pressure(total: u64, avail: u64, psi_some: f64, psi_full: f64) -> (f64, bool) {
     let pct = if total > 0 {
         avail as f64 * 100.0 / total as f64
     } else {
         100.0
     };
-    (pct, pct < crit_avail_pct() || psi > crit_psi())
+    // Critical means REAL scarcity. PSI alone must never freeze apps: on an
+    // idle-ish desktop a single cgroup-capped process (or a zram reclaim
+    // burst) pushes psi_full past 10 with half the RAM free — measured live,
+    // that exact pattern froze Chrome at 55.8% avail. PSI only lowers the
+    // avail threshold (pressure near scarcity), never triggers alone.
+    let near_scarcity = crit_avail_pct() * 3.0;
+    (
+        pct,
+        pct < crit_avail_pct()
+            || (pct < near_scarcity && psi_full >= crit_psi())
+            || (pct < near_scarcity && psi_some >= 60.0),
+    )
 }
 
-/// (mem_total_mb, mem_avail_mb, psi_some_avg10, swap_total_mb, swap_used_mb)
-fn mem_info() -> (u64, u64, f64, u64, u64) {
+/// (mem_total_mb, mem_avail_mb, psi_some_avg10, psi_full_avg10, swap_total_mb, swap_used_mb)
+fn mem_info() -> (u64, u64, f64, f64, u64, u64) {
     let mut total = 0;
     let mut avail = 0;
     let mut swap_total = 0;
@@ -437,12 +452,18 @@ fn mem_info() -> (u64, u64, f64, u64, u64) {
             }
         }
     }
-    let mut psi = 0.0;
+    let mut psi_some = 0.0;
+    let mut psi_full = 0.0;
     if let Some(p) = read_trim("/proc/pressure/memory") {
-        if let Some(line) = p.lines().next() {
+        for line in p.lines() {
             for tok in line.split_whitespace() {
                 if let Some(v) = tok.strip_prefix("avg10=") {
-                    psi = v.parse().unwrap_or(0.0);
+                    let n: f64 = v.parse().unwrap_or(0.0);
+                    if line.starts_with("some") {
+                        psi_some = n;
+                    } else if line.starts_with("full") {
+                        psi_full = n;
+                    }
                 }
             }
         }
@@ -450,7 +471,8 @@ fn mem_info() -> (u64, u64, f64, u64, u64) {
     (
         total,
         avail,
-        psi,
+        psi_some,
+        psi_full,
         swap_total,
         swap_total.saturating_sub(swap_free),
     )
@@ -790,7 +812,11 @@ fn cmd_state() {
         // Browser families get the live tab list reported by the companion
         // extension (written to the cache by `tabs-host`); others get [].
         let c = comm(*pid);
-        let tabs_json = if is_browser_comm(&c) { tabs_cache_json() } else { "[]".to_string() };
+        let tabs_json = if is_browser_comm(&c) {
+            tabs_cache_json()
+        } else {
+            "[]".to_string()
+        };
         out.push_str(&format!(
             "{{\"pid\":{pid},\"name\":\"{}\",\"title\":\"{}\",\"rss_mb\":{rss_mb},\"unit\":\"{}\",\"mechanism\":\"{mechanism}\",\"frozen\":{frozen},\"windows\":{},\"procs\":{nprocs},\"wins\":[{}],\"tabs\":{}}}",
             json_escape(&c),
@@ -854,9 +880,9 @@ fn cmd_state() {
         })
         .collect();
 
-    let (total, avail, psi, swap_total, swap_used) = mem_info();
+    let (total, avail, psi, psi_full, swap_total, swap_used) = mem_info();
     let (zswap_avail, zswap_on, zram_backed) = zswap_status();
-    let (avail_pct, critical) = pressure(total, avail, psi);
+    let (avail_pct, critical) = pressure(total, avail, psi, psi_full);
     let now_json = match now_from_history() {
         Some((c, m)) => format!("{{\"cpu\":{c:.1},\"mem\":{m:.1}}}"),
         None => "null".to_string(),
@@ -1242,7 +1268,17 @@ fn cmd_procs(pid: u64) {
                 .and_then(|t| t.rfind(')').map(|rp| t[rp + 2..].to_string()))
                 .and_then(|rest| rest.chars().next().map(|c| c.to_string()))
                 .unwrap_or_else(|| "?".into());
-            (*p, comm(*p), rss_kb(*p) / 1024, state, if *p == pid { "browser".to_string() } else { proc_role(*p) })
+            (
+                *p,
+                comm(*p),
+                rss_kb(*p) / 1024,
+                state,
+                if *p == pid {
+                    "browser".to_string()
+                } else {
+                    proc_role(*p)
+                },
+            )
         })
         .collect();
     fn role_rank(r: &str) -> u8 {
@@ -1448,7 +1484,7 @@ fn sample_history(
     }
     *prev = st;
 
-    let (ttotal, tavail, _, _, _) = mem_info();
+    let (ttotal, tavail, _, _, _, _) = mem_info();
     let mem_pct = if ttotal > 0 {
         (ttotal - tavail) as f32 * 100.0 / ttotal as f32
     } else {
@@ -1502,9 +1538,10 @@ fn sample_history(
 /// Memory-pressure watchdog: freeze biggest apps while pressure is critical.
 fn cmd_watch() {
     eprintln!(
-        "task-manager watch: pid {} crit avail<{:.0}% or psi>{:.0}, recover>{:.0}%, max {} per episode",
+        "task-manager watch: pid {} crit avail<{:.0}%, or avail<{:.0}% + psi_full>{:.0}, sustained 5s, recover>{:.0}%, max {} per episode",
         std::process::id(),
         crit_avail_pct(),
+        crit_avail_pct() * 3.0,
         crit_psi(),
         recover_avail_pct(),
         max_freeze_per_episode()
@@ -1515,10 +1552,15 @@ fn cmd_watch() {
     let mut prev_stat = cpu_times();
     let mut prev_cpu = cpu_times();
     let mut prev_apps: BTreeMap<String, u64> = BTreeMap::new();
+    // Per-app cooldown: never auto-freeze the same app twice within 10 min —
+    // re-freezing the user's browser every pressure blip reads as "Chrome
+    // keeps hanging".
+    let mut last_frozen: BTreeMap<String, std::time::Instant> = BTreeMap::new();
+    let mut no_candidates_since: Option<std::time::Instant> = None;
     let mut tick = 0u32;
     loop {
-        let (total, avail, psi, _, _) = mem_info();
-        let (pct, mut crit) = pressure(total, avail, psi);
+        let (total, avail, psi_some, psi_full, _, _) = mem_info();
+        let (pct, mut crit) = pressure(total, avail, psi_some, psi_full);
         // CPU trigger (pref watchMaxCpu, 0 = off): freeze the biggest app
         // when total CPU stays pegged — freezing stops the burn instantly.
         let cpu_max = crit_cpu_pct();
@@ -1536,24 +1578,49 @@ fn cmd_watch() {
             hits += 1;
         } else {
             hits = 0;
+            no_candidates_since = None;
             if pct > recover_avail_pct() {
                 frozen_this_episode = 0;
             }
         }
-        if hits >= 2 && frozen_this_episode < max_freeze_per_episode() {
+        // Sustained pressure only: 10 ticks × 500ms = 5s. Zram reclaim bursts
+        // spike psi for 1-3s routinely; those must not freeze anything.
+        if hits >= 10
+            && frozen_this_episode < max_freeze_per_episode()
+            && no_candidates_since.is_none()
+        {
+            let on_cooldown = |what: &str| -> bool {
+                let name = what.split(" (").next().unwrap_or(what);
+                last_frozen
+                    .get(name)
+                    .map(|t| t.elapsed() < std::time::Duration::from_secs(600))
+                    .unwrap_or(false)
+            };
             match freeze_biggest() {
+                Some(what) if on_cooldown(&what) => {
+                    eprintln!("watch: pressure critical but {what} froze <10min ago — skip");
+                    hits = 0;
+                    std::thread::sleep(std::time::Duration::from_millis(5000));
+                }
                 Some(what) => {
                     eprintln!(
-                        "watch: pressure critical ({pct:.1}% avail, psi {psi:.1}, cpu {cpu_now:.0}%/{cpu_max:.0}) — froze {what}"
+                        "watch: pressure critical ({pct:.1}% avail, psi_some {psi_some:.1}, psi_full {psi_full:.1}, cpu {cpu_now:.0}%/{cpu_max:.0}) — froze {what}"
                     );
+                    let name = what.split(" (").next().unwrap_or(&what).to_string();
+                    last_frozen.insert(name, std::time::Instant::now());
                     frozen_this_episode += 1;
                     hits = 0;
                     std::thread::sleep(std::time::Duration::from_millis(2000));
                     continue;
                 }
                 None => {
+                    // Log once, then stay out of this episode: the loop's
+                    // guard blocks further freeze attempts until pressure
+                    // clears (no_candidates_since resets on the else branch).
+                    // No extra sleep — the 500ms tick keeps sampling history.
                     eprintln!("watch: pressure critical but no candidates left");
                     hits = 0;
+                    no_candidates_since = Some(std::time::Instant::now());
                 }
             }
         }
@@ -1803,7 +1870,9 @@ fn main() {
         "thaw" if args.len() == 3 => cmd_thaw(args[2].parse().unwrap_or_else(|_| usage())),
         "focus" if args.len() == 3 => cmd_focus(args[2].parse().unwrap_or_else(|_| usage())),
         "kill" if args.len() == 3 => cmd_kill(args[2].parse().unwrap_or_else(|_| usage())),
-        "freeze-pid" if args.len() == 3 => cmd_freeze_pid(args[2].parse().unwrap_or_else(|_| usage())),
+        "freeze-pid" if args.len() == 3 => {
+            cmd_freeze_pid(args[2].parse().unwrap_or_else(|_| usage()))
+        }
         "thaw-pid" if args.len() == 3 => cmd_thaw_pid(args[2].parse().unwrap_or_else(|_| usage())),
         "kill-pid" if args.len() == 3 => cmd_kill_pid(args[2].parse().unwrap_or_else(|_| usage())),
         "zswap-copy" => cmd_zswap_copy(),
