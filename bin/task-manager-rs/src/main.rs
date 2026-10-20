@@ -1979,6 +1979,7 @@ fn main() {
             hygiene::sweep();
             println!("{}", hygiene::report());
         }
+        "governor-explain" => governor::cmd_explain(),
         "governor-release" => {
             let n = governor::release_all();
             println!("released {n}");

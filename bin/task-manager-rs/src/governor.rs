@@ -51,6 +51,15 @@ const SELF_PSI_NO_RECLAIM: f64 = 10.0;
 /// Most we push out of one app per idle period: switching back to it must
 /// not mean faulting its whole working set in from zram.
 const RECLAIM_PER_IDLE_MAX: u64 = 512 * MIB;
+/// How long a leaf's peak usage keeps protecting it (floor = peak / 2).
+const PEAK_WINDOW: Duration = Duration::from_secs(120);
+/// Interpreters, shells and launchers: sharing one of these names with a
+/// window says nothing about being that app (a build's `bash`/`python3`
+/// next to some windowed script), so the comm-family rule skips them.
+const GENERIC_COMMS: &[&str] = &[
+    "bash", "sh", "dash", "zsh", "fish", "env", "nice", "timeout", "sudo", "make", "python",
+    "python3", "node", "bun", "deno", "perl", "ruby", "java", "uwsm", "systemd-run",
+];
 
 /// Processes that make a leaf untouchable wherever it lives.
 const PROTECT_COMMS: &[&str] = &[
@@ -152,7 +161,17 @@ pub enum HighAction {
 
 /// Next memory.high for a leaf. `high` None = currently unlimited ("max").
 /// `squeeze` = this class is eligible at the current level.
-pub fn next_high(cur: u64, high: Option<u64>, level: Level, squeeze: bool, self_psi: f64) -> HighAction {
+/// `peak` = the leaf's recent peak (see Governor::recent_peak): a build's
+/// working set is its peak concurrency, not the dip between two jobs, so the
+/// limit never goes below half of it.
+pub fn next_high(
+    cur: u64,
+    high: Option<u64>,
+    level: Level,
+    squeeze: bool,
+    self_psi: f64,
+    peak: u64,
+) -> HighAction {
     if !squeeze {
         // Loosen gradually: dropping a tight limit at once lets the leaf
         // balloon straight back and re-create the pressure we just cleared.
@@ -175,9 +194,17 @@ pub fn next_high(cur: u64, high: Option<u64>, level: Level, squeeze: bool, self_
             None => HighAction::Keep,
         };
     }
+    // Tighten only while the leaf presses on its limit; one that dropped
+    // well below it (jobs ended) already gave memory back.
+    if let Some(h) = high {
+        if cur < h / 10 * 9 {
+            return HighAction::Keep;
+        }
+    }
     let factor = if level == Level::Critical { 0.92 } else { 0.97 };
-    let base = high.map(|h| h.min(cur)).unwrap_or(cur);
-    let target = ((base as f64 * factor) as u64).max(FLOOR_BYTES);
+    let base = high.unwrap_or(cur);
+    let floor = FLOOR_BYTES.max(peak.max(cur) / 2);
+    let target = ((base as f64 * factor) as u64).max(floor);
     match high {
         Some(h) if target >= h => HighAction::Keep,
         None if target >= cur => HighAction::Keep,
@@ -351,6 +378,8 @@ pub struct Governor {
     last_focus: BTreeMap<String, Instant>,
     /// Bytes reclaimed from a leaf since it was last focused.
     idle_reclaimed: BTreeMap<String, u64>,
+    /// (peak memory.current, when it was set): decays after PEAK_WINDOW.
+    recent_peak: BTreeMap<String, (u64, Instant)>,
     started: Instant,
     reclaimed_total: u64,
 }
@@ -366,9 +395,18 @@ impl Governor {
             saved: BTreeMap::new(),
             last_focus: BTreeMap::new(),
             idle_reclaimed: BTreeMap::new(),
+            recent_peak: BTreeMap::new(),
             started: Instant::now(),
             reclaimed_total: 0,
         }
+    }
+
+    fn peak(&mut self, rel: &str, cur: u64, now: Instant) -> u64 {
+        let e = self.recent_peak.entry(rel.to_string()).or_insert((cur, now));
+        if cur >= e.0 || now.duration_since(e.1) > PEAK_WINDOW {
+            *e = (cur, now);
+        }
+        e.0
     }
 
     fn enabled() -> bool {
@@ -411,11 +449,15 @@ impl Governor {
         // A browser splits across scopes (window pid moved to its own scope,
         // renderers left in the launcher's), so "has a window" goes by comm
         // too, the same family rule the app rows use.
-        let windowed_comms: BTreeSet<String> = windowed.iter().map(|p| comm(*p)).collect();
+        let windowed_comms: BTreeSet<String> = windowed
+            .iter()
+            .map(|p| comm(*p))
+            .filter(|c| !GENERIC_COMMS.contains(&c.as_str()))
+            .collect();
         let focus = focused_pid();
         // Same family rule for focus: the renderers of the focused browser
         // live in another scope than its window.
-        let focus_comm = focus.map(comm);
+        let focus_comm = focus.map(comm).filter(|c| !GENERIC_COMMS.contains(&c.as_str()));
         let ours_frozen: BTreeSet<String> = marker_units().into_iter().collect();
         let now = Instant::now();
 
@@ -484,7 +526,8 @@ impl Governor {
             let action = if ours && matches!(class, Class::Foreground | Class::Interactive | Class::Protected) {
                 HighAction::Release
             } else {
-                next_high(cur, high, lvl, squeeze, psi)
+                let peak = self.peak(&rel, cur, now);
+                next_high(cur, high, lvl, squeeze, psi, peak)
             };
             match action {
                 HighAction::Keep => {
@@ -537,6 +580,7 @@ impl Governor {
         self.saved.retain(|k, _| live.contains(k));
         self.last_focus.retain(|k, _| live.contains(k));
         self.idle_reclaimed.retain(|k, _| live.contains(k));
+        self.recent_peak.retain(|k, _| live.contains(k));
 
         // Proactive reclaim, longest-idle first, then biggest.
         idle.sort_by_key(|i| (std::cmp::Reverse(i.3.as_secs() / 60), std::cmp::Reverse(i.1)));
@@ -591,6 +635,49 @@ impl Governor {
     }
 }
 
+/// `task-manager governor-explain`: how every leaf >= 64 MB is classified
+/// right now, and why (read-only; for debugging "why was X (not) limited").
+pub fn cmd_explain() {
+    let mons = monitors();
+    let windowed: BTreeSet<u64> = clients(&mons).iter().map(|w| w.pid).collect();
+    let windowed_comms: BTreeSet<String> = windowed
+        .iter()
+        .map(|p| comm(*p))
+        .filter(|c| !GENERIC_COMMS.contains(&c.as_str()))
+        .collect();
+    let focus = focused_pid();
+    let focus_comm = focus.map(comm).filter(|c| !GENERIC_COMMS.contains(&c.as_str()));
+    println!("windowed comms: {windowed_comms:?}  focused: {focus:?} {focus_comm:?}");
+    for rel in leaves() {
+        let pids = procs(&rel);
+        let cur = read_u64(&rel, "memory.current");
+        if pids.is_empty() || cur < 64 * MIB {
+            continue;
+        }
+        let comms: Vec<String> = pids.iter().map(|p| comm(*p)).collect();
+        let by_pid_focus = focus.map(|f| pids.contains(&f)).unwrap_or(false);
+        let by_comm_focus = focus_comm.as_ref().map(|c| comms.contains(c)).unwrap_or(false);
+        let win_pid = pids.iter().any(|p| windowed.contains(p));
+        let win_comm: Vec<&String> = comms.iter().filter(|c| windowed_comms.contains(*c)).collect();
+        let class = classify(&rel, &comms, by_pid_focus || by_comm_focus, win_pid || !win_comm.is_empty());
+        let mut why = Vec::new();
+        if by_pid_focus { why.push("focused pid".to_string()); }
+        if by_comm_focus { why.push(format!("focused comm {:?}", focus_comm.as_deref().unwrap_or(""))); }
+        if win_pid { why.push("window pid".to_string()); }
+        if !win_comm.is_empty() { why.push(format!("window comm {:?}", win_comm.first().unwrap())); }
+        if let Some(c) = comms.iter().find(|c| PROTECT_COMMS.contains(&c.as_str())) { why.push(format!("protected comm {c:?}")); }
+        let high = read_trim(&format!("{CGROOT}{rel}/memory.high")).unwrap_or_default();
+        println!(
+            "{:>6} MB  {:<11} high={:<10} {}  [{}]",
+            cur / MIB,
+            format!("{class:?}"),
+            high,
+            unit_of(&rel),
+            why.join(", ")
+        );
+    }
+}
+
 /// Governor status JSON for `state` (written by the watch daemon).
 pub fn status_json() -> String {
     let raw = fs::read_to_string(state_path()).unwrap_or_default();
@@ -639,33 +726,49 @@ mod tests {
     #[test]
     fn squeeze_steps_down_and_respects_floor() {
         let g = 1024 * MIB;
-        match next_high(4 * g, None, Level::Elevated, true, 0.0) {
+        match next_high(4 * g, None, Level::Elevated, true, 0.0, 0) {
             HighAction::Set(v) => assert!(v < 4 * g && v > 3 * g),
             a => panic!("{a:?}"),
         }
         // Critical squeezes harder than elevated.
-        let HighAction::Set(e) = next_high(4 * g, None, Level::Elevated, true, 0.0) else { panic!() };
-        let HighAction::Set(c) = next_high(4 * g, None, Level::Critical, true, 0.0) else { panic!() };
+        let HighAction::Set(e) = next_high(4 * g, None, Level::Elevated, true, 0.0, 0) else { panic!() };
+        let HighAction::Set(c) = next_high(4 * g, None, Level::Critical, true, 0.0, 0) else { panic!() };
         assert!(c < e);
         // Never below the floor; at the floor it holds.
-        assert_eq!(next_high(300 * MIB, Some(FLOOR_BYTES), Level::Critical, true, 0.0), HighAction::Keep);
+        assert_eq!(next_high(300 * MIB, Some(FLOOR_BYTES), Level::Critical, true, 0.0, 0), HighAction::Keep);
         // Small leaves are not worth a limit.
-        assert_eq!(next_high(100 * MIB, None, Level::Critical, true, 0.0), HighAction::Keep);
+        assert_eq!(next_high(100 * MIB, None, Level::Critical, true, 0.0, 0), HighAction::Keep);
+    }
+
+    #[test]
+    fn squeeze_follows_the_limit_not_the_dips() {
+        let g = 1024 * MIB;
+        // Jobs ended: usage far below the limit -> hold, don't chase it down.
+        assert_eq!(next_high(g / 2, Some(2 * g), Level::Critical, true, 0.0, 0), HighAction::Keep);
+        // Pressing on the limit -> tighten from the limit.
+        let HighAction::Set(v) = next_high(2 * g, Some(2 * g), Level::Elevated, true, 0.0, 0) else { panic!() };
+        assert!(v < 2 * g && v > g);
+        // Never below half the recent peak.
+        assert_eq!(next_high(g, Some(g), Level::Critical, true, 0.0, 2 * g), HighAction::Keep);
+        // Half the peak above current usage: nothing to take yet.
+        assert_eq!(next_high(3 * g, None, Level::Critical, true, 0.0, 8 * g), HighAction::Keep);
+        // Limit sits on the floor (peak / 2): it holds there.
+        assert_eq!(next_high(4 * g, Some(4 * g), Level::Critical, true, 0.0, 8 * g), HighAction::Keep);
     }
 
     #[test]
     fn squeeze_loosens_when_leaf_stalls() {
         let h = 1024 * MIB;
-        assert_eq!(next_high(h, Some(h), Level::Critical, true, 55.0), HighAction::Set(h + h / 16));
-        assert_eq!(next_high(h, None, Level::Critical, true, 55.0), HighAction::Keep);
+        assert_eq!(next_high(h, Some(h), Level::Critical, true, 55.0, 0), HighAction::Set(h + h / 16));
+        assert_eq!(next_high(h, None, Level::Critical, true, 55.0, 0), HighAction::Keep);
     }
 
     #[test]
     fn release_is_gradual() {
         let h = 1024 * MIB;
-        assert_eq!(next_high(h, Some(h), Level::Calm, false, 0.0), HighAction::Set(h + h / 4));
-        assert_eq!(next_high(h, Some(h + 400 * MIB), Level::Calm, false, 0.0), HighAction::Release);
-        assert_eq!(next_high(h, None, Level::Calm, false, 0.0), HighAction::Keep);
+        assert_eq!(next_high(h, Some(h), Level::Calm, false, 0.0, 0), HighAction::Set(h + h / 4));
+        assert_eq!(next_high(h, Some(h + 400 * MIB), Level::Calm, false, 0.0, 0), HighAction::Release);
+        assert_eq!(next_high(h, None, Level::Calm, false, 0.0, 0), HighAction::Keep);
     }
 
     #[test]
