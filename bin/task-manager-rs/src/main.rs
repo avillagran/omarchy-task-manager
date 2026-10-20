@@ -388,7 +388,7 @@ fn crit_psi() -> f64 {
     env::var("TM_CRIT_PSI")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(10.0)
+        .unwrap_or(30.0)
 }
 /// CPU % above which the watchdog also freezes (0 = CPU trigger off).
 fn crit_cpu_pct() -> f64 {
@@ -418,24 +418,23 @@ fn max_freeze_per_episode() -> u32 {
 }
 
 /// (avail_pct, critical)
-fn pressure(total: u64, avail: u64, psi_some: f64, psi_full: f64) -> (f64, bool) {
+fn pressure(total: u64, avail: u64, _psi_some: f64, psi_full: f64) -> (f64, bool) {
     let pct = if total > 0 {
         avail as f64 * 100.0 / total as f64
     } else {
         100.0
     };
-    // Critical means REAL scarcity. PSI alone must never freeze apps: on an
-    // idle-ish desktop a single cgroup-capped process (or a zram reclaim
-    // burst) pushes psi_full past 10 with half the RAM free — measured live,
-    // that exact pattern froze Chrome at 55.8% avail. PSI only lowers the
-    // avail threshold (pressure near scarcity), never triggers alone.
-    let near_scarcity = crit_avail_pct() * 3.0;
-    (
-        pct,
-        pct < crit_avail_pct()
-            || (pct < near_scarcity && psi_full >= crit_psi())
-            || (pct < near_scarcity && psi_some >= 60.0),
-    )
+    (pct, freeze_critical(pct, crit_avail_pct(), psi_full, crit_psi()))
+}
+
+/// Freezing is the LAST resort: the governor owns everything above real
+/// scarcity. PSI alone never freezes (a zram reclaim burst pushes psi_full
+/// past 10 with half the RAM free; that froze Chrome at 55.8% avail), and
+/// even PSI near scarcity froze an idle user's Chrome at 17% avail after a
+/// reboot (session restore + a daemon starting): stalls only count within
+/// half the critical margin again, and only when severe.
+fn freeze_critical(pct: f64, crit: f64, psi_full: f64, crit_psi: f64) -> bool {
+    pct < crit || (pct < crit * 1.5 && psi_full >= crit_psi)
 }
 
 /// (mem_total_mb, mem_avail_mb, psi_some_avg10, psi_full_avg10, swap_total_mb, swap_used_mb)
@@ -1628,7 +1627,7 @@ fn cmd_watch() {
         "task-manager watch: pid {} crit avail<{:.0}%, or avail<{:.0}% + psi_full>{:.0}, sustained 5s, recover>{:.0}%, max {} per episode",
         std::process::id(),
         crit_avail_pct(),
-        crit_avail_pct() * 3.0,
+        crit_avail_pct() * 1.5,
         crit_psi(),
         recover_avail_pct(),
         max_freeze_per_episode()
@@ -1992,5 +1991,23 @@ fn main() {
         "procs" if args.len() == 3 => cmd_procs(args[2].parse().unwrap_or_else(|_| usage())),
         "pref" if args.len() == 4 => cmd_pref(&args[2], &args[3]),
         _ => usage(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::freeze_critical;
+
+    #[test]
+    fn freeze_only_at_real_scarcity() {
+        // The 2026-10-20 false positive: 17% avail, psi_full 45.8.
+        assert!(!freeze_critical(17.0, 6.0, 45.8, 30.0));
+        // Plenty free, any stall: never.
+        assert!(!freeze_critical(55.8, 6.0, 90.0, 30.0));
+        // Below the critical margin: always.
+        assert!(freeze_critical(5.0, 6.0, 0.0, 30.0));
+        // Close to it with a severe stall: yes; with a mild one: no.
+        assert!(freeze_critical(8.0, 6.0, 35.0, 30.0));
+        assert!(!freeze_critical(8.0, 6.0, 15.0, 30.0));
     }
 }
