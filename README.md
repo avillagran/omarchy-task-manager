@@ -98,6 +98,26 @@ dead quickshell instances automatically, and suggests deleting `/tmp` trees
 of yours that nothing touched for 24 h and no process holds open
 (`task-manager clean-tmp list` shows them, `clean-tmp` deletes them).
 
+## Browser Memory Saver
+
+On macOS and Windows, Chrome also discards background tabs when the OS
+reports memory pressure. On Linux nothing tells it, so tabs only leave memory
+through Memory Saver's inactivity timer. When a Chromium-family browser is
+running without it, the card offers to enforce it through the managed policy
+`HighEfficiencyModeEnabled` (Chrome 108+). Omarchy already manages Chrome this
+way for theme colors. The command asks for your password in Omarchy's
+floating terminal:
+
+```sh
+task-manager chrome-memory-saver on    # writes omarchy-task-manager-memory-saver.json
+task-manager chrome-memory-saver off   # removes it (back to the browser setting)
+```
+
+The policy covers Chrome (`/etc/opt/chrome`), Chromium (`/etc/chromium`) and
+Brave (`/etc/brave`) when they are installed. The savings level stays your
+choice in `chrome://settings/performance`. `install.sh --uninstall` never uses
+sudo, so run `off` first if you want the policy gone.
+
 ## zswap vs zram
 
 Omarchy swaps to zram (compressed RAM). Do **not** enable zswap on top of

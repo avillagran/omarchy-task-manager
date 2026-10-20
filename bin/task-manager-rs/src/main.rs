@@ -13,6 +13,7 @@
 //! The grey visual is rendered by the QML overlay (state JSON carries window
 //! geometry for frozen apps); no compositor rules are needed.
 
+mod browser;
 mod governor;
 mod hygiene;
 
@@ -978,6 +979,21 @@ fn cmd_state() {
             .to_string(),
         );
     }
+    // Browser Memory Saver: the one tab-discarding path Linux has (no OS
+    // memory-pressure signal reaches Chrome here, unlike macOS/Windows).
+    let saver = browser::status();
+    if saver == Some(false) && apps.iter().any(|a| is_browser_comm(&comm(a.0))) {
+        sug.push(
+            serde_json::json!({
+                "kind": "memory-saver",
+                "text": "En macOS, Chrome descarta pestañas cuando falta memoria; en Linux no recibe ese aviso. Activar su Ahorro de memoria (política, pide tu contraseña) libera las pestañas inactivas",
+                "action": "run",
+                "cmd": "chrome-memory-saver",
+                "pid": 0
+            })
+            .to_string(),
+        );
+    }
     // Governor at work: say what is being held back, so slow builds are
     // explained instead of looking broken.
     let gov: Value = serde_json::from_str(&governor::status_json()).unwrap_or(Value::Null);
@@ -1009,9 +1025,13 @@ fn cmd_state() {
         );
     }
     let sug_json = format!("\"suggestions\":[{}]", sug.join(","));
+    let saver_json = match saver {
+        Some(b) => b.to_string(),
+        None => "null".to_string(),
+    };
     let gov_json = if gov.is_null() { "null".to_string() } else { gov.to_string() };
     println!(
-        "{{\"mem\":{{\"total_mb\":{total},\"avail_mb\":{avail},\"psi_some10\":{psi:.2},\"swap_total_mb\":{swap_total},\"swap_used_mb\":{swap_used}}},\"pressure\":{{\"avail_pct\":{avail_pct:.1},\"critical\":{critical}}},\"zswap\":{{\"available\":{zswap_avail},\"enabled\":{zswap_on},\"zram\":{zram_backed}}},\"governor\":{gov_json},\"hygiene\":{hyg},\"now\":{now_json},\"prefs\":{prefs},\"monitors\":[{}],{out},{bg_json},{sys_json},{sug_json}}}",
+        "{{\"mem\":{{\"total_mb\":{total},\"avail_mb\":{avail},\"psi_some10\":{psi:.2},\"swap_total_mb\":{swap_total},\"swap_used_mb\":{swap_used}}},\"pressure\":{{\"avail_pct\":{avail_pct:.1},\"critical\":{critical}}},\"zswap\":{{\"available\":{zswap_avail},\"enabled\":{zswap_on},\"zram\":{zram_backed}}},\"governor\":{gov_json},\"hygiene\":{hyg},\"memory_saver\":{saver_json},\"now\":{now_json},\"prefs\":{prefs},\"monitors\":[{}],{out},{bg_json},{sys_json},{sug_json}}}",
         mons_json.join(",")
     );
 }
@@ -1750,7 +1770,7 @@ fn cmd_zswap_copy() {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: task-manager <state|wins PID|freeze PID|thaw PID|focus PID|kill PID|freeze-pid PID|thaw-pid PID|kill-pid PID|procs PID|zswap-copy|clean-tmp|hygiene|governor-release|pref K V|history|watch|follow>"
+        "usage: task-manager <state|wins PID|freeze PID|thaw PID|focus PID|kill PID|freeze-pid PID|thaw-pid PID|kill-pid PID|procs PID|zswap-copy|chrome-memory-saver [on|off]|clean-tmp|hygiene|governor-release|pref K V|history|watch|follow>"
     );
     std::process::exit(1)
 }
@@ -1979,6 +1999,7 @@ fn main() {
             println!("{}", hygiene::report());
         }
         "governor-explain" => governor::cmd_explain(),
+        "chrome-memory-saver" => browser::cmd_memory_saver(args.get(2).map(|s| s.as_str())),
         "governor-release" => {
             let n = governor::release_all();
             println!("released {n}");
