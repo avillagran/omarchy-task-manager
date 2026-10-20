@@ -102,21 +102,22 @@ of yours that nothing touched for 24 h and no process holds open
 
 On macOS and Windows, Chrome also discards background tabs when the OS
 reports memory pressure. On Linux nothing tells it, so tabs only leave memory
-through Memory Saver's inactivity timer. When a Chromium-family browser is
-running without it, the card offers to enforce it through the managed policy
-`HighEfficiencyModeEnabled` (Chrome 108+). Omarchy already manages Chrome this
-way for theme colors. The command asks for your password in Omarchy's
-floating terminal:
+through Memory Saver's inactivity timer, which Chromium registers as **off by
+default** (`performance_tuning.high_efficiency_mode.state` in the profile's
+`Local State`). When a Chromium-family browser has it off, the card offers to
+turn it on. It is the user's own preference and needs no root:
+
+- browser closed: the preference is written right away;
+- browser running: its `chrome://settings/performance` page opens so you can
+  flip it now, and the change is queued (the running browser would overwrite
+  `Local State` on exit); the daemon writes it the moment the browser exits.
 
 ```sh
-task-manager chrome-memory-saver on    # writes omarchy-task-manager-memory-saver.json
-task-manager chrome-memory-saver off   # removes it (back to the browser setting)
+task-manager chrome-memory-saver on     # or: off
 ```
 
-The policy covers Chrome (`/etc/opt/chrome`), Chromium (`/etc/chromium`) and
-Brave (`/etc/brave`) when they are installed. The savings level stays your
-choice in `chrome://settings/performance`. `install.sh --uninstall` never uses
-sudo, so run `off` first if you want the policy gone.
+Covers Chrome, Chromium and Brave profiles under `~/.config`. The savings level
+stays your choice.
 
 ## zswap vs zram
 

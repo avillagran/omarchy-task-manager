@@ -1,103 +1,176 @@
-//! Chromium-family Memory Saver via managed policy.
+//! Chromium-family Memory Saver, as the user's own preference.
 //!
 //! On macOS and Windows, Chrome also discards background tabs when the OS
-//! signals memory pressure. Linux has no such signal for it, so tabs only
-//! ever leave memory through Memory Saver's inactivity timer, and that is
-//! user-controlled. The `HighEfficiencyModeEnabled` policy (chrome.* 108+)
-//! turns it on for good; the savings level stays the user's choice.
-//! Omarchy already manages Chrome through /etc/opt/chrome/policies/managed
-//! (theme colors), so this adds no new "managed" banner.
+//! signals memory pressure. Linux sends no such signal, so tabs only leave
+//! memory through Memory Saver's inactivity timer, and Chromium registers
+//! that preference as disabled by default
+//! (`performance_tuning.high_efficiency_mode.state`, 0 = off, 2 = on, in
+//! the profile's "Local State"). The file is the user's, so no root is
+//! involved, but a running browser rewrites it from memory on exit:
+//! - browser closed: the preference is written right away;
+//! - browser running: its Performance settings page opens so the user can
+//!   flip it now, and the change is queued; the watch daemon writes it the
+//!   moment the browser exits.
 
+use crate::runtime_dir;
+use serde_json::Value;
+use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-const POLICY_FILE: &str = "omarchy-task-manager-memory-saver.json";
-const POLICY_BODY: &str = "{\"HighEfficiencyModeEnabled\": true}\n";
+const STATE_ON: i64 = 2;
 
-/// (browser binary that must exist, its managed-policy dir)
-const BROWSERS: &[(&str, &str)] = &[
-    ("/opt/google/chrome/chrome", "/etc/opt/chrome/policies/managed"),
-    ("/usr/bin/chromium", "/etc/chromium/policies/managed"),
-    ("/usr/bin/brave", "/etc/brave/policies/managed"),
+struct Browser {
+    name: &'static str,
+    /// Profile dir under $HOME holding "Local State".
+    profile: &'static str,
+    /// Executable path prefix, to tell whether it runs.
+    exe_prefix: &'static str,
+    /// Launcher that hands a URL to the running instance.
+    launcher: &'static str,
+}
+
+const BROWSERS: &[Browser] = &[
+    Browser { name: "chrome", profile: ".config/google-chrome", exe_prefix: "/opt/google/chrome/", launcher: "google-chrome-stable" },
+    Browser { name: "chromium", profile: ".config/chromium", exe_prefix: "/usr/lib/chromium/", launcher: "chromium" },
+    Browser { name: "brave", profile: ".config/BraveSoftware/Brave-Browser", exe_prefix: "/opt/brave", launcher: "brave" },
 ];
 
-fn installed() -> impl Iterator<Item = &'static str> {
-    BROWSERS
-        .iter()
-        .filter(|(bin, _)| Path::new(bin).exists())
-        .map(|(_, dir)| *dir)
+fn local_state(b: &Browser) -> String {
+    format!("{}/{}/Local State", env::var("HOME").unwrap_or_default(), b.profile)
 }
 
-/// None = no Chromium-family browser installed; Some(on) otherwise
-/// (on = our policy is in place for every installed browser).
+fn present(b: &Browser) -> bool {
+    Path::new(&local_state(b)).exists()
+}
+
+fn state_of(b: &Browser) -> Option<i64> {
+    let raw = fs::read_to_string(local_state(b)).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    Some(
+        v.pointer("/performance_tuning/high_efficiency_mode/state")
+            .and_then(|s| s.as_i64())
+            .unwrap_or(0),
+    )
+}
+
+fn explicit(b: &Browser) -> bool {
+    fs::read_to_string(local_state(b))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .map(|v| v.pointer("/performance_tuning/high_efficiency_mode/state").is_some())
+        .unwrap_or(false)
+}
+
+fn running(b: &Browser) -> bool {
+    let Ok(rd) = fs::read_dir("/proc") else {
+        return false;
+    };
+    rd.flatten().any(|e| {
+        fs::read_link(e.path().join("exe"))
+            .map(|t| t.to_string_lossy().starts_with(b.exe_prefix))
+            .unwrap_or(false)
+    })
+}
+
+fn pending_path(b: &Browser) -> String {
+    format!("{}/omarchy-task-manager/memory-saver-pending-{}", runtime_dir(), b.name)
+}
+
+/// Write the preference (browser must be closed). Atomic: Local State is
+/// the browser's whole machine-wide state, a torn write would reset it.
+fn write_pref(b: &Browser, on: bool) -> bool {
+    let path = local_state(b);
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(mut v) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    if !v.is_object() {
+        return false;
+    }
+    let pt = v
+        .as_object_mut()
+        .unwrap()
+        .entry("performance_tuning")
+        .or_insert_with(|| serde_json::json!({}));
+    if !pt.is_object() {
+        *pt = serde_json::json!({});
+    }
+    let hem = pt
+        .as_object_mut()
+        .unwrap()
+        .entry("high_efficiency_mode")
+        .or_insert_with(|| serde_json::json!({}));
+    if !hem.is_object() {
+        *hem = serde_json::json!({});
+    }
+    hem["state"] = Value::from(if on { STATE_ON } else { 0 });
+    let tmp = format!("{path}.tm-tmp");
+    fs::write(&tmp, v.to_string()).is_ok() && fs::rename(&tmp, &path).is_ok()
+}
+
+/// None = no Chromium-family profile; Some(on) = Memory Saver on in every
+/// profile present (or queued for one that is running).
 pub fn status() -> Option<bool> {
-    let dirs: Vec<&str> = installed().collect();
-    if dirs.is_empty() {
+    let present: Vec<&Browser> = BROWSERS.iter().filter(|b| present(b)).collect();
+    if present.is_empty() {
         return None;
     }
-    Some(dirs.iter().all(|d| Path::new(&format!("{d}/{POLICY_FILE}")).exists()))
+    Some(present.iter().all(|b| {
+        state_of(b) == Some(STATE_ON) || Path::new(&pending_path(b)).exists()
+    }))
 }
 
-fn apply(on: bool) -> bool {
-    let mut ok = true;
-    for dir in installed() {
-        let path = format!("{dir}/{POLICY_FILE}");
-        let r = if on {
-            fs::create_dir_all(dir).and_then(|_| fs::write(&path, POLICY_BODY))
-        } else if Path::new(&path).exists() {
-            fs::remove_file(&path)
-        } else {
-            Ok(())
+/// Watch-daemon hook: apply queued changes once their browser has exited.
+pub fn apply_pending() {
+    for b in BROWSERS {
+        let p = pending_path(b);
+        let Ok(want) = fs::read_to_string(&p) else {
+            continue;
         };
-        if let Err(e) = r {
-            eprintln!("{path}: {e}");
-            ok = false;
+        if running(b) {
+            continue;
         }
+        let on = want.trim() != "off";
+        // The user may have chosen in the settings page we opened: an
+        // explicit value there is theirs (an untouched pref has no key).
+        if explicit(b) && on {
+            let _ = fs::remove_file(&p);
+            continue;
+        }
+        if write_pref(b, on) {
+            eprintln!("browser: {} Memory Saver {} (applied after exit)", b.name, if on { "on" } else { "off" });
+        }
+        let _ = fs::remove_file(&p);
     }
-    ok
-}
-
-fn is_root() -> bool {
-    use std::os::unix::fs::MetadataExt;
-    fs::metadata("/proc/self").map(|m| m.uid() == 0).unwrap_or(false)
 }
 
 /// `task-manager chrome-memory-saver [on|off]` (default on; the UI passes
-/// a dummy pid). Writes need root: as root it applies directly; otherwise
-/// it re-runs itself through sudo, in Omarchy's floating terminal when a
-/// password is needed.
+/// a dummy pid).
 pub fn cmd_memory_saver(arg: Option<&str>) {
     let on = arg != Some("off");
-    if is_root() {
-        let ok = apply(on);
-        println!("{}", if ok { "ok" } else { "failed" });
-        if ok {
-            println!(
-                "Memory Saver {}: browsers pick it up within minutes (chrome://policy > Reload policies applies it now).",
-                if on { "enforced" } else { "back to user control" }
-            );
+    for b in BROWSERS.iter().filter(|b| present(b)) {
+        if state_of(b) == Some(if on { STATE_ON } else { 0 }) {
+            let _ = fs::remove_file(pending_path(b));
+            println!("{}: already {}", b.name, if on { "on" } else { "off" });
+            continue;
         }
-        return;
-    }
-    let me = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "task-manager".into());
-    let verb = if on { "on" } else { "off" };
-    let quiet = Command::new("sudo")
-        .args(["-n", &me, "chrome-memory-saver", verb])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if quiet {
-        return;
-    }
-    let cmd = format!("sudo '{me}' chrome-memory-saver {verb}");
-    let spawned = Command::new("omarchy-launch-floating-terminal-with-presentation")
-        .arg(&cmd)
-        .spawn()
-        .is_ok();
-    if !spawned {
-        println!("run: {cmd}");
+        if !running(b) {
+            let ok = write_pref(b, on);
+            println!("{}: {}", b.name, if ok { "set" } else { "could not write Local State" });
+            continue;
+        }
+        let _ = fs::create_dir_all(format!("{}/omarchy-task-manager", runtime_dir()));
+        let _ = fs::write(pending_path(b), if on { "on" } else { "off" });
+        let _ = Command::new(b.launcher)
+            .arg("chrome://settings/performance")
+            .spawn();
+        println!(
+            "{}: running; settings page opened, and the change applies itself when it exits",
+            b.name
+        );
     }
 }

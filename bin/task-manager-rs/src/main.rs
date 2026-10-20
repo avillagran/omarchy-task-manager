@@ -986,7 +986,7 @@ fn cmd_state() {
         sug.push(
             serde_json::json!({
                 "kind": "memory-saver",
-                "text": "En macOS, Chrome descarta pestañas cuando falta memoria; en Linux no recibe ese aviso. Activar su Ahorro de memoria (política, pide tu contraseña) libera las pestañas inactivas",
+                "text": "En macOS, Chrome descarta pestañas cuando falta memoria; en Linux no recibe ese aviso y su Ahorro de memoria viene apagado. Actívalo para que libere las pestañas inactivas",
                 "action": "run",
                 "cmd": "chrome-memory-saver",
                 "pid": 0
@@ -1672,6 +1672,10 @@ fn cmd_watch() {
         // below stays a last resort.
         if tick % 4 == 0 {
             gov.tick(pct, psi_some);
+        }
+        // Queued browser Memory Saver change: applied once the browser exits.
+        if tick % 20 == 7 {
+            browser::apply_pending();
         }
         // tmpfs hygiene: 30s after start, then every 10 minutes.
         // Off-thread: the /proc and /tmp walks must not delay freezes.
