@@ -57,6 +57,13 @@ removed, your config untouched:
 curl -fsSL https://raw.githubusercontent.com/avillagran/omarchy-task-manager/main/install.sh | bash -s -- --uninstall
 ```
 
+Comes bundled with the
+[Omarchy Control Panel](https://github.com/avillagran/omarchy-control-panel),
+which installs it on by default. It stays a standalone plugin: Control
+Panel > Task Manager turns it off (`bash install.sh --disable`: watchdog
+stopped, paused apps thawed, widget hidden, config kept) and back on
+(`--enable`).
+
 ## Shortcut
 
 Nothing touches your keybinds without asking. Open the card, hit the gear,
@@ -104,6 +111,15 @@ companion extension, over Chrome's Native Messaging, 100% local:
   the extension step into a one-click install; the manifest's fixed `key`
   keeps the extension ID stable, so the native host registration keeps
   working unchanged.
+
+## Development note: `import QtQuick 6.11`
+
+Every QML file imports `QtQuick 6.11` (and `QtQuick.Window 6.11`), never the
+unversioned module. Qt 6.12 added a `QtQuick` `Color` singleton that shadows
+`Color` from Omarchy's `qs.Commons`, leaving theme colors `undefined`
+(white surfaces, black text, `Cannot read property 'background' of
+undefined`). An unversioned `import QtQuick.Window` re-imports the latest
+QtQuick and brings the problem back. New files must use the pinned import.
 
 ## Layout
 

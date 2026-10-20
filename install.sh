@@ -4,6 +4,8 @@
 #   curl -fsSL <raw-url>/install.sh | bash
 #   bash install.sh --local       # dev: symlink the current checkout
 #   bash install.sh --uninstall   # stop watchdog, thaw everything, remove unit
+#   bash install.sh --disable     # pause the plugin: stop watchdog, thaw, hide
+#   bash install.sh --enable      # undo --disable (same as a plain install)
 #
 # Idempotent: safe to re-run. Never touches user data, never uses sudo.
 set -euo pipefail
@@ -70,6 +72,18 @@ uninstall() {
   omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
   log "done. Plugin dir (if present) was left in place; remove it with:"
   log "  omarchy plugin remove $PLUGIN_ID --yes"
+}
+
+# Soft off switch (used by the Omarchy Control Panel): keeps the plugin
+# folder, the veil rule and the user's prefs, so --enable brings it back as it
+# was. Frozen apps are thawed first; a disabled widget could never resume them.
+disable() {
+  log "disabling"
+  thaw_all
+  systemctl --user disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
+  omarchy plugin disable "$PLUGIN_ID" >/dev/null 2>&1 || true
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  log "disabled. Turn it back on with: bash install.sh --enable"
 }
 
 install_unit() {
@@ -148,6 +162,7 @@ remove_veil_rule() {
 main() {
   case "${1:-}" in
     --uninstall|uninstall) uninstall; exit 0 ;;
+    --disable|disable) disable; exit 0 ;;
     --local)
       mkdir -p "$PLUGINS_DIR"
       if [ -L "$PLUGIN_DIR" ] && [ "$(readlink -f "$PLUGIN_DIR")" = "$HERE" ]; then
@@ -157,7 +172,7 @@ main() {
         log "symlinked $HERE -> $PLUGIN_DIR"
       fi
       ;;
-    "")
+    ""|--enable|enable)
       if [ -d "$PLUGIN_DIR" ]; then
         log "plugin already present, reusing $PLUGIN_DIR"
       else
@@ -167,7 +182,7 @@ main() {
         }
       fi
       ;;
-    *) log "unknown option: $1 (use --local or --uninstall)"; exit 1 ;;
+    *) log "unknown option: $1 (use --local, --enable, --disable or --uninstall)"; exit 1 ;;
   esac
 
   omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
