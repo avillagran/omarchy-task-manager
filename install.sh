@@ -34,6 +34,8 @@ thaw_all() {
   dir="$(plugin_dir 2>/dev/null)" || return 0
   launcher="$dir/bin/task-manager-launch.sh"
   [ -x "$launcher" ] || return 0
+  # Nor throttled: drop every memory.high the governor set.
+  "$launcher" governor-release >/dev/null 2>&1 || true
   state="$("$launcher" state 2>/dev/null)" || return 0
   pids="$(printf '%s' "$state" | python3 -c '
 import sys, json
@@ -79,8 +81,10 @@ uninstall() {
 # was. Frozen apps are thawed first; a disabled widget could never resume them.
 disable() {
   log "disabling"
-  thaw_all
+  # Stop first: a running daemon would re-apply governor limits right after
+  # thaw_all released them.
   systemctl --user disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
+  thaw_all
   omarchy plugin disable "$PLUGIN_ID" >/dev/null 2>&1 || true
   omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
   log "disabled. Turn it back on with: bash install.sh --enable"

@@ -104,6 +104,14 @@ BarWidget {
   property real memNow: 0.0
   property var expandedProcs: ({})
   property var suggestions: []
+  // Destructive suggestion actions (confirm: true) need a second click
+  // within 5s; this holds the armed command.
+  property string armedCmd: ""
+  Timer {
+    id: armTimer
+    interval: 5000
+    onTriggered: root.armedCmd = ""
+  }
   property var procsRaw: ({})
   property var procsData: ({})
   property var procsQueue: []
@@ -1587,6 +1595,8 @@ BarWidget {
               Text {
                 Layout.fillWidth: true
                 text: "💡 " + modelData.text
+                  + (root.armedCmd !== "" && root.armedCmd === modelData.cmd
+                     ? "  — " + root.tr("clickAgainConfirm") : "")
                 color: Color.popups.text
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
@@ -1604,6 +1614,22 @@ BarWidget {
                 accent: true
                 onClicked: root.tabDiscardAll()
               }
+              // Helper subcommand (clean-tmp, zswap-copy): the helper does
+              // the work and notifies; the next poll drops the suggestion.
+              RowBtn {
+                visible: modelData.action === "run"
+                glyph: modelData.cmd === "zswap-copy" ? "\uF0C5" : "\uF1F8"
+                accent: !modelData.confirm || root.armedCmd === modelData.cmd
+                danger: !!modelData.confirm && root.armedCmd === modelData.cmd
+                onClicked: {
+                  if (modelData.confirm && root.armedCmd !== modelData.cmd) {
+                    root.armedCmd = modelData.cmd
+                    armTimer.restart()
+                    return
+                  }
+                  root.armedCmd = ""
+                  root.action(modelData.cmd, 0)
+                }
               }
             }
           }

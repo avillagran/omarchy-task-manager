@@ -13,6 +13,9 @@
 //! The grey visual is rendered by the QML overlay (state JSON carries window
 //! geometry for frozen apps); no compositor rules are needed.
 
+mod governor;
+mod hygiene;
+
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
@@ -25,8 +28,14 @@ const CGROOT: &str = "/sys/fs/cgroup";
 const MIN_BG_RSS_KB: u64 = 30 * 1024;
 /// Auto-freeze never targets apps smaller than this.
 const MIN_FREEZE_MB: u64 = 100;
-/// One-liner the user runs to enable zswap for this boot (shown in the UI).
+/// One-liner the user runs to enable zswap for this boot (shown in the UI
+/// only when swap is NOT on zram).
 const ZSWAP_ENABLE_CMD: &str = "sudo sh -c 'echo Y > /sys/module/zswap/parameters/enabled'";
+/// zswap in front of zram compresses every page twice (lzo, then zstd),
+/// burns CPU on writeback and fails allocations under pressure. This turns
+/// it off now and drops the boot rule older Task Manager docs told users
+/// to create.
+const ZSWAP_DISABLE_CMD: &str = "sudo sh -c 'echo N > /sys/module/zswap/parameters/enabled; rm -f /etc/tmpfiles.d/zswap.conf'";
 /// Squeeze target while frozen: clamp(current/4, SQUEEZE_MIN, SQUEEZE_MAX).
 const SQUEEZE_MIN_BYTES: u64 = 96 * 1024 * 1024;
 const SQUEEZE_MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -87,7 +96,10 @@ fn live_sig() -> String {
 }
 
 fn hyprctl(args: &[&str]) -> String {
-    let out = Command::new("hyprctl")
+    // timeout(1): a hung compositor must not stall the watch loop.
+    let out = Command::new("timeout")
+        .arg("2")
+        .arg("hyprctl")
         .args(args)
         .env("HYPRLAND_INSTANCE_SIGNATURE", live_sig())
         .output();
@@ -922,14 +934,85 @@ fn cmd_state() {
             }
         }
     }
+    // zswap stacked on zram: double compression (see ZSWAP_DISABLE_CMD).
+    if zswap_on && zram_backed {
+        sug.push(
+            "{\"kind\":\"zswap\",\"text\":\"zswap está activo encima de zram: cada página se comprime dos veces y falla al reclamar bajo presión. Copia el comando para apagarlo\",\"action\":\"run\",\"cmd\":\"zswap-copy\",\"pid\":0}".to_string(),
+        );
+    }
+    // Stale /tmp trees: tmpfs files are RAM that no reclaim can free.
+    let hyg = hygiene::report();
+    let stale_mb = hyg.get("tmp_stale_mb").and_then(|v| v.as_u64()).unwrap_or(0);
+    if stale_mb >= hygiene::TMP_SUGGEST_MIN_MB {
+        let n = hyg.get("tmp_stale_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let top: Vec<String> = hyg
+            .get("tmp_stale_top")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .take(3)
+                    .filter_map(|e| {
+                        let p = e.get("path")?.as_str()?;
+                        Some(format!("{} ({} MB)", p.trim_start_matches("/tmp/"), e.get("mb")?.as_u64()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let more = n.saturating_sub(top.len() as u64);
+        let list = if more > 0 {
+            format!("{} y {more} más", top.join(", "))
+        } else {
+            top.join(", ")
+        };
+        // serde builds it: /tmp names may hold any byte json_escape misses.
+        // confirm = the UI asks for a second click; clean-tmp only deletes
+        // what this report listed.
+        sug.push(
+            serde_json::json!({
+                "kind": "tmp",
+                "text": format!("/tmp retiene {stale_mb} MB de RAM en {n} elementos sin uso hace más de 24 h ({list}). Borrarlos libera esa memoria"),
+                "action": "run",
+                "cmd": "clean-tmp",
+                "confirm": true,
+                "pid": 0
+            })
+            .to_string(),
+        );
+    }
+    // Governor at work: say what is being held back, so slow builds are
+    // explained instead of looking broken.
+    let gov: Value = serde_json::from_str(&governor::status_json()).unwrap_or(Value::Null);
+    if let Some(lim) = gov.get("limited").and_then(|v| v.as_array()) {
+        if !lim.is_empty() {
+            let names: Vec<String> = lim
+                .iter()
+                .take(3)
+                .filter_map(|e| Some(format!("{} ≤{} MB", e.get("name")?.as_str()?, e.get("high_mb")?.as_u64()?)))
+                .collect();
+            sug.push(
+                serde_json::json!({
+                    "kind": "governor",
+                    "text": format!(
+                        "Conteniendo {} proceso(s) en segundo plano para que el escritorio siga fluido: {}",
+                        lim.len(),
+                        names.join(", ")
+                    ),
+                    "action": "none",
+                    "pid": 0
+                })
+                .to_string(),
+            );
+        }
+    }
     if avail_pct < 25.0 {
         sug.push(
             "{\"kind\":\"pressure\",\"text\":\"Presión de memoria alta — pausa las apps que no estés usando\",\"action\":\"none\",\"pid\":0}".to_string(),
         );
     }
     let sug_json = format!("\"suggestions\":[{}]", sug.join(","));
+    let gov_json = if gov.is_null() { "null".to_string() } else { gov.to_string() };
     println!(
-        "{{\"mem\":{{\"total_mb\":{total},\"avail_mb\":{avail},\"psi_some10\":{psi:.2},\"swap_total_mb\":{swap_total},\"swap_used_mb\":{swap_used}}},\"pressure\":{{\"avail_pct\":{avail_pct:.1},\"critical\":{critical}}},\"zswap\":{{\"available\":{zswap_avail},\"enabled\":{zswap_on},\"zram\":{zram_backed}}},\"now\":{now_json},\"prefs\":{prefs},\"monitors\":[{}],{out},{bg_json},{sys_json},{sug_json}}}",
+        "{{\"mem\":{{\"total_mb\":{total},\"avail_mb\":{avail},\"psi_some10\":{psi:.2},\"swap_total_mb\":{swap_total},\"swap_used_mb\":{swap_used}}},\"pressure\":{{\"avail_pct\":{avail_pct:.1},\"critical\":{critical}}},\"zswap\":{{\"available\":{zswap_avail},\"enabled\":{zswap_on},\"zram\":{zram_backed}}},\"governor\":{gov_json},\"hygiene\":{hyg},\"now\":{now_json},\"prefs\":{prefs},\"monitors\":[{}],{out},{bg_json},{sys_json},{sug_json}}}",
         mons_json.join(",")
     );
 }
@@ -1561,10 +1644,21 @@ fn cmd_watch() {
     // keeps hanging".
     let mut last_frozen: BTreeMap<String, std::time::Instant> = BTreeMap::new();
     let mut no_candidates_since: Option<std::time::Instant> = None;
+    let mut gov = governor::Governor::new();
     let mut tick = 0u32;
     loop {
         let (total, avail, psi_some, psi_full, _, _) = mem_info();
         let (pct, mut crit) = pressure(total, avail, psi_some, psi_full);
+        // Governor every 2s: squeeze background work early so the freeze
+        // below stays a last resort.
+        if tick % 4 == 0 {
+            gov.tick(pct, psi_some);
+        }
+        // tmpfs hygiene: 30s after start, then every 10 minutes.
+        // Off-thread: the /proc and /tmp walks must not delay freezes.
+        if tick % 1200 == 60 {
+            std::thread::spawn(hygiene::sweep);
+        }
         // CPU trigger (pref watchMaxCpu, 0 = off): freeze the biggest app
         // when total CPU stays pegged — freezing stops the burn instantly.
         let cpu_max = crit_cpu_pct();
@@ -1609,6 +1703,7 @@ fn cmd_watch() {
                     last_frozen.insert(name, std::time::Instant::now());
                     frozen_this_episode += 1;
                     hits = 0;
+                    tick += 1;
                     std::thread::sleep(std::time::Duration::from_millis(2000));
                     continue;
                 }
@@ -1641,19 +1736,22 @@ fn cmd_zswap_copy() {
         Ok(c) => c,
         Err(_) => {
             // No clipboard tool: print the command so the caller can show it.
-            println!("{ZSWAP_ENABLE_CMD}");
+            let (_, enabled, zram) = zswap_status();
+            println!("{}", if enabled && zram { ZSWAP_DISABLE_CMD } else { ZSWAP_ENABLE_CMD });
             return;
         }
     };
+    let (_, enabled, zram) = zswap_status();
+    let cmd = if enabled && zram { ZSWAP_DISABLE_CMD } else { ZSWAP_ENABLE_CMD };
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(ZSWAP_ENABLE_CMD.as_bytes());
+        let _ = stdin.write_all(cmd.as_bytes());
     }
     let _ = child.wait();
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: task-manager <state|wins PID|freeze PID|thaw PID|focus PID|kill PID|freeze-pid PID|thaw-pid PID|kill-pid PID|procs PID|zswap-copy|pref K V|history|watch|follow>"
+        "usage: task-manager <state|wins PID|freeze PID|thaw PID|focus PID|kill PID|freeze-pid PID|thaw-pid PID|kill-pid PID|procs PID|zswap-copy|clean-tmp|hygiene|governor-release|pref K V|history|watch|follow>"
     );
     std::process::exit(1)
 }
@@ -1875,6 +1973,16 @@ fn main() {
         "thaw-pid" if args.len() == 3 => cmd_thaw_pid(args[2].parse().unwrap_or_else(|_| usage())),
         "kill-pid" if args.len() == 3 => cmd_kill_pid(args[2].parse().unwrap_or_else(|_| usage())),
         "zswap-copy" => cmd_zswap_copy(),
+        // `clean-tmp list` = dry run; the UI passes a dummy pid arg.
+        "clean-tmp" => hygiene::cmd_clean_tmp(args.get(2).map(|a| a == "list").unwrap_or(false)),
+        "hygiene" => {
+            hygiene::sweep();
+            println!("{}", hygiene::report());
+        }
+        "governor-release" => {
+            let n = governor::release_all();
+            println!("released {n}");
+        }
         "watch" => cmd_watch(),
         "follow" => cmd_follow(),
         "tabs-host" => cmd_tabs_host(),

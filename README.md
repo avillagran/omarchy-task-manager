@@ -70,17 +70,47 @@ Nothing touches your keybinds without asking. Open the card, hit the gear,
 and flip **Show window shortcut** on: that's `SUPER+SHIFT+T`. Same switch
 turns it off.
 
-## Recommended: zswap (compressed RAM)
+## Memory governor
 
-Without zswap, reclaimed pages go straight to disk. One-time enable:
+The watchdog's freeze is the last resort. Before that point, the governor
+(part of the same `watch` daemon, every 2s) keeps the desktop fluid the
+way macOS does, using cgroup v2 knobs on the user's own delegated subtree
+(no root):
+
+| Level | When | What |
+|---|---|---|
+| calm | ≥ 30% RAM available | limits loosen gradually, then are removed |
+| elevated | < 25% available (or stalls with < 33%) | windowless scopes (agents, builds, test runners) get a `memory.high` a few % below their size each tick, so they reclaim their own pages and slow down instead of evicting your apps; windowed apps unfocused for 2+ min hand cold pages to zram in small `memory.reclaim` chunks |
+| critical | < 12% available | the same, harder; windowless services are limited too |
+
+Never touched: the session (Hyprland, the shell), audio, the focused app,
+anything frozen. A limited group that stalls on its own memory gets its
+limit loosened, never squeezed into a livelock. Every limit is restored when
+pressure clears, on daemon restart, and on `--disable`/`--uninstall`
+(`task-manager governor-release`). The card lists what is being held back.
+Off switch: `task-manager pref governor 0`.
+
+## tmpfs hygiene
+
+`/tmp` and `$XDG_RUNTIME_DIR` live in RAM: a file there stays in memory (or
+swap) until deleted, and no reclaim can drop it. The daemon removes logs of
+dead quickshell instances automatically, and suggests deleting `/tmp` trees
+of yours that nothing touched for 24 h and no process holds open
+(`task-manager clean-tmp list` shows them, `clean-tmp` deletes them).
+
+## zswap vs zram
+
+Omarchy swaps to zram (compressed RAM). Do **not** enable zswap on top of
+it: every page gets compressed twice, writeback allocations fail under
+pressure, and reclaim gets slower. If an older version of this README made
+you create `/etc/tmpfiles.d/zswap.conf`, the card flags it and copies the fix:
 
 ```sh
-sudo sh -c 'echo Y > /sys/module/zswap/parameters/enabled'
-echo "w /sys/module/zswap/parameters/enabled - - - - Y" | sudo tee /etc/tmpfiles.d/zswap.conf
+sudo sh -c 'echo N > /sys/module/zswap/parameters/enabled; rm -f /etc/tmpfiles.d/zswap.conf'
 ```
 
-The card detects a missing zswap and shows these commands with a copy
-button.
+Only on a machine whose swap is a plain disk (no zram) is zswap worth it;
+the card then offers the enable command instead.
 
 ## Browser tab titles (optional bridge)
 

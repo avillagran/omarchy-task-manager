@@ -26,7 +26,8 @@
     "prefsCpu": "Auto-pause when CPU ≥",
     "prefsRefresh": "Refresh data now",
     "prefsHint": "Beyond these limits the watchdog pauses the largest apps so the system stays responsive. CPU 'Off' disables that trigger.",
-    "system": "System"
+    "system": "System",
+    "clickAgainConfirm": "click again to confirm"
   },
   "es": {
     "title": "Administrador de tareas",
@@ -55,7 +56,8 @@
     "prefsCpu": "Pausar apps si CPU ≥",
     "prefsRefresh": "Actualizar datos ahora",
     "prefsHint": "Al superar estos límites, el vigilante pausa las apps más grandes para que el sistema siga respondiendo. CPU «Desactivado» apaga ese disparador.",
-    "system": "Sistema"
+    "system": "Sistema",
+    "clickAgainConfirm": "haz clic de nuevo para confirmar"
   },
   "pt": {
     "title": "Gerenciador de tarefas",
@@ -84,7 +86,8 @@
     "prefsCpu": "Pausar apps se CPU ≥",
     "prefsRefresh": "Atualizar dados agora",
     "prefsHint": "Além destes limites, o vigilante pausa os maiores apps para manter o sistema responsivo. CPU «Desativado» desliga esse gatilho.",
-    "system": "Sistema"
+    "system": "Sistema",
+    "clickAgainConfirm": "clique de novo para confirmar"
   },
   "fr": {
     "title": "Gestionnaire des tâches",
@@ -113,7 +116,8 @@
     "prefsCpu": "Suspendre si CPU ≥",
     "prefsRefresh": "Actualiser les données",
     "prefsHint": "Au-delà de ces limites, le gardien suspend les applis les plus lourdes pour garder le système fluide. CPU « Désactivé » coupe ce déclencheur.",
-    "system": "Système"
+    "system": "Système",
+    "clickAgainConfirm": "cliquez à nouveau pour confirmer"
   },
   "de": {
     "title": "Task-Manager",
@@ -142,6 +146,7 @@
     "prefsCpu": "Apps pausieren bei CPU ≥",
     "prefsRefresh": "Daten jetzt aktualisieren",
     "prefsHint": "Über diesen Grenzen pausiert der Wächter die größten Apps, damit das System reaktionsfähig bleibt. CPU „Aus“ deaktiviert diesen Auslöser.",
-    "system": "System"
+    "system": "System",
+    "clickAgainConfirm": "zum Bestätigen erneut klicken"
   }
 }
