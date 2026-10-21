@@ -1641,8 +1641,27 @@ fn sample_history(
     hist.write();
 }
 
+/// One watchdog per user: two governors would fight over the same cgroups
+/// and the same governor.json (a second instance's limits end up owned by
+/// nobody). The lock is a pid file checked for a live task-manager.
+fn watch_lock() -> bool {
+    let path = format!("{}/omarchy-task-manager/watch.pid", runtime_dir());
+    let _ = fs::create_dir_all(format!("{}/omarchy-task-manager", runtime_dir()));
+    if let Some(pid) = read_trim(&path).and_then(|s| s.parse::<u64>().ok()) {
+        let me = std::process::id() as u64;
+        if pid != me && comm(pid).starts_with("task-manager") {
+            return false;
+        }
+    }
+    fs::write(&path, std::process::id().to_string()).is_ok()
+}
+
 /// Memory-pressure watchdog: freeze biggest apps while pressure is critical.
 fn cmd_watch() {
+    if !watch_lock() {
+        eprintln!("task-manager watch: another instance is running; exiting");
+        std::process::exit(0);
+    }
     eprintln!(
         "task-manager watch: pid {} crit avail<{:.0}%, or avail<{:.0}% + psi_full>{:.0}, sustained 5s, recover>{:.0}%, max {} per episode",
         std::process::id(),

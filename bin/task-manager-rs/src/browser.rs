@@ -6,18 +6,18 @@
 //! that preference as disabled by default
 //! (`performance_tuning.high_efficiency_mode.state`, 0 = off, 2 = on, in
 //! the profile's "Local State"). The file is the user's, so no root is
-//! involved, but a running browser rewrites it from memory on exit:
-//! - browser closed: the preference is written right away;
-//! - browser running: its Performance settings page opens so the user can
-//!   flip it now, and the change is queued; the watch daemon writes it the
-//!   moment the browser exits.
+//! involved, but a browser only reads it at startup and rewrites it from
+//! memory on exit. So the user's intent is stored on disk once
+//! (`chrome-memory-saver on`, or the card's button) and the watch daemon
+//! applies it, with no further action, whenever that browser is not
+//! running: at login before it is opened, or the moment it exits. A value
+//! the user set themselves in the browser (the key exists) is never
+//! overridden by the daemon.
 
-use crate::runtime_dir;
 use serde_json::Value;
 use std::env;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 const STATE_ON: i64 = 2;
 
@@ -27,40 +27,31 @@ struct Browser {
     profile: &'static str,
     /// Executable path prefix, to tell whether it runs.
     exe_prefix: &'static str,
-    /// Launcher that hands a URL to the running instance.
-    launcher: &'static str,
 }
 
 const BROWSERS: &[Browser] = &[
-    Browser { name: "chrome", profile: ".config/google-chrome", exe_prefix: "/opt/google/chrome/", launcher: "google-chrome-stable" },
-    Browser { name: "chromium", profile: ".config/chromium", exe_prefix: "/usr/lib/chromium/", launcher: "chromium" },
-    Browser { name: "brave", profile: ".config/BraveSoftware/Brave-Browser", exe_prefix: "/opt/brave", launcher: "brave" },
+    Browser { name: "chrome", profile: ".config/google-chrome", exe_prefix: "/opt/google/chrome/" },
+    Browser { name: "chromium", profile: ".config/chromium", exe_prefix: "/usr/lib/chromium/" },
+    Browser { name: "brave", profile: ".config/BraveSoftware/Brave-Browser", exe_prefix: "/opt/brave" },
 ];
 
+fn home() -> String {
+    env::var("HOME").unwrap_or_default()
+}
+
 fn local_state(b: &Browser) -> String {
-    format!("{}/{}/Local State", env::var("HOME").unwrap_or_default(), b.profile)
+    format!("{}/{}/Local State", home(), b.profile)
 }
 
 fn present(b: &Browser) -> bool {
     Path::new(&local_state(b)).exists()
 }
 
-fn state_of(b: &Browser) -> Option<i64> {
+/// The pref as stored: None = never set (Chromium's default, off).
+fn stored(b: &Browser) -> Option<i64> {
     let raw = fs::read_to_string(local_state(b)).ok()?;
     let v: Value = serde_json::from_str(&raw).ok()?;
-    Some(
-        v.pointer("/performance_tuning/high_efficiency_mode/state")
-            .and_then(|s| s.as_i64())
-            .unwrap_or(0),
-    )
-}
-
-fn explicit(b: &Browser) -> bool {
-    fs::read_to_string(local_state(b))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .map(|v| v.pointer("/performance_tuning/high_efficiency_mode/state").is_some())
-        .unwrap_or(false)
+    v.pointer("/performance_tuning/high_efficiency_mode/state")?.as_i64()
 }
 
 fn running(b: &Browser) -> bool {
@@ -74,12 +65,17 @@ fn running(b: &Browser) -> bool {
     })
 }
 
-fn pending_path(b: &Browser) -> String {
-    format!("{}/omarchy-task-manager/memory-saver-pending-{}", runtime_dir(), b.name)
+/// Persistent (survives reboots, unlike $XDG_RUNTIME_DIR): "on" / "off".
+fn intent_path() -> String {
+    format!("{}/.local/state/omarchy-task-manager/memory-saver", home())
 }
 
-/// Write the preference (browser must be closed). Atomic: Local State is
-/// the browser's whole machine-wide state, a torn write would reset it.
+fn intent_on() -> bool {
+    fs::read_to_string(intent_path()).map(|s| s.trim() == "on").unwrap_or(false)
+}
+
+/// Write the pref (browser must be closed). Atomic: Local State is the
+/// browser's whole machine-wide state; a torn write would reset it.
 fn write_pref(b: &Browser, on: bool) -> bool {
     let path = local_state(b);
     let Ok(raw) = fs::read_to_string(&path) else {
@@ -88,12 +84,10 @@ fn write_pref(b: &Browser, on: bool) -> bool {
     let Ok(mut v) = serde_json::from_str::<Value>(&raw) else {
         return false;
     };
-    if !v.is_object() {
+    let Some(root) = v.as_object_mut() else {
         return false;
-    }
-    let pt = v
-        .as_object_mut()
-        .unwrap()
+    };
+    let pt = root
         .entry("performance_tuning")
         .or_insert_with(|| serde_json::json!({}));
     if !pt.is_object() {
@@ -112,65 +106,55 @@ fn write_pref(b: &Browser, on: bool) -> bool {
     fs::write(&tmp, v.to_string()).is_ok() && fs::rename(&tmp, &path).is_ok()
 }
 
-/// None = no Chromium-family profile; Some(on) = Memory Saver on in every
-/// profile present (or queued for one that is running).
+/// None = no Chromium-family profile. Some(true) = on everywhere, or
+/// queued (intent on, browser running, pref untouched).
 pub fn status() -> Option<bool> {
     let present: Vec<&Browser> = BROWSERS.iter().filter(|b| present(b)).collect();
     if present.is_empty() {
         return None;
     }
-    Some(present.iter().all(|b| {
-        state_of(b) == Some(STATE_ON) || Path::new(&pending_path(b)).exists()
+    let queued = intent_on();
+    Some(present.iter().all(|b| match stored(b) {
+        Some(s) => s == STATE_ON,
+        None => queued,
     }))
 }
 
-/// Watch-daemon hook: apply queued changes once their browser has exited.
+/// Watch-daemon hook: apply the stored intent to every closed browser whose
+/// pref is still untouched.
 pub fn apply_pending() {
+    if !intent_on() {
+        return;
+    }
     for b in BROWSERS {
-        let p = pending_path(b);
-        let Ok(want) = fs::read_to_string(&p) else {
-            continue;
-        };
-        if running(b) {
+        if !present(b) || stored(b).is_some() || running(b) {
             continue;
         }
-        let on = want.trim() != "off";
-        // The user may have chosen in the settings page we opened: an
-        // explicit value there is theirs (an untouched pref has no key).
-        if explicit(b) && on {
-            let _ = fs::remove_file(&p);
-            continue;
+        if write_pref(b, true) {
+            eprintln!("browser: {} Memory Saver turned on", b.name);
         }
-        if write_pref(b, on) {
-            eprintln!("browser: {} Memory Saver {} (applied after exit)", b.name, if on { "on" } else { "off" });
-        }
-        let _ = fs::remove_file(&p);
     }
 }
 
 /// `task-manager chrome-memory-saver [on|off]` (default on; the UI passes
-/// a dummy pid).
+/// a dummy pid). An explicit request: closed browsers get it now, even over
+/// a previous value; running ones as soon as they close.
 pub fn cmd_memory_saver(arg: Option<&str>) {
     let on = arg != Some("off");
+    let p = intent_path();
+    if let Some(dir) = Path::new(&p).parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(&p, if on { "on\n" } else { "off\n" });
     for b in BROWSERS.iter().filter(|b| present(b)) {
-        if state_of(b) == Some(if on { STATE_ON } else { 0 }) {
-            let _ = fs::remove_file(pending_path(b));
+        let want = if on { STATE_ON } else { 0 };
+        if stored(b).unwrap_or(0) == want {
             println!("{}: already {}", b.name, if on { "on" } else { "off" });
-            continue;
-        }
-        if !running(b) {
+        } else if running(b) {
+            println!("{}: running, applies itself when it closes", b.name);
+        } else {
             let ok = write_pref(b, on);
             println!("{}: {}", b.name, if ok { "set" } else { "could not write Local State" });
-            continue;
         }
-        let _ = fs::create_dir_all(format!("{}/omarchy-task-manager", runtime_dir()));
-        let _ = fs::write(pending_path(b), if on { "on" } else { "off" });
-        let _ = Command::new(b.launcher)
-            .arg("chrome://settings/performance")
-            .spawn();
-        println!(
-            "{}: running; settings page opened, and the change applies itself when it exits",
-            b.name
-        );
     }
 }

@@ -104,20 +104,14 @@ On macOS and Windows, Chrome also discards background tabs when the OS
 reports memory pressure. On Linux nothing tells it, so tabs only leave memory
 through Memory Saver's inactivity timer, which Chromium registers as **off by
 default** (`performance_tuning.high_efficiency_mode.state` in the profile's
-`Local State`). When a Chromium-family browser has it off, the card offers to
-turn it on. It is the user's own preference and needs no root:
+`Local State`). It is the user's own preference, so no root is involved.
 
-- browser closed: the preference is written right away;
-- browser running: its `chrome://settings/performance` page opens so you can
-  flip it now, and the change is queued (the running browser would overwrite
-  `Local State` on exit); the daemon writes it the moment the browser exits.
-
-```sh
-task-manager chrome-memory-saver on     # or: off
-```
-
-Covers Chrome, Chromium and Brave profiles under `~/.config`. The savings level
-stays your choice.
+Opt in once with the card's button or `task-manager chrome-memory-saver on`
+(`off` to stop). From then on nothing else is needed: a browser only reads
+the pref at startup and rewrites it on exit, so the daemon applies it whenever
+the browser is not running, at login before it opens or the moment it closes.
+A value you set yourself in the browser's settings is never overridden.
+Covers Chrome, Chromium and Brave profiles under `~/.config`.
 
 ## zswap vs zram
 
