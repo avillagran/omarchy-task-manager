@@ -1,45 +1,52 @@
-//! omarchy-task-manager helper (POC v2).
+//! omarchy-task-manager engine.
 //!
 //! Usage:
 //!   task-manager state          JSON: {mem:{...}, monitors:[...], apps:[...]}
-//!   task-manager freeze <pid>   freeze app + squeeze its RAM (memory.high)
-//!   task-manager thaw <pid>     restore memory.high + resume
-//!   task-manager focus <pid>    focus the app's window
-//!   task-manager kill <pid>     thaw + SIGTERM
+//!   task-manager freeze T       freeze app + squeeze its RAM (memory.high)
+//!   task-manager thaw T         restore memory.high + resume
+//!   task-manager focus T        focus the app's window
+//!   task-manager kill T         thaw + SIGTERM, SIGKILL if still alive
+//!   task-manager shell-reset [force|list]   restart the Omarchy shell
 //!
-//! Freeze = cgroup v2 freezer via `systemctl --user freeze` (atomic per app).
-//! While frozen, memory.high is lowered so the kernel reclaims the app's cold
-//! pages to swap — RAM actually drops without killing the app.
-//! The grey visual is rendered by the QML overlay (state JSON carries window
-//! geometry for frozen apps); no compositor rules are needed.
+//! T is `PID` or `PID:START` (START = /proc/PID/stat starttime, as printed in
+//! the state JSON): with START the command refuses a pid the kernel reused.
+//!
+//! Freeze = the cgroup v2 freezer of the app's scope (atomic per app), written
+//! directly in the user's delegated cgroup subtree. While frozen, memory.high
+//! is lowered so the kernel reclaims the app's cold pages to swap — RAM
+//! actually drops without killing the app. Every signal goes through a pidfd.
 
-mod browser;
+#[macro_use]
+mod json;
 mod governor;
-mod hygiene;
+mod hypr;
+mod safefs;
+mod shell;
+mod sys;
 
-use serde_json::Value;
+use json::Value;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const CGROOT: &str = "/sys/fs/cgroup";
 /// Background comm-group floor.
 const MIN_BG_RSS_KB: u64 = 30 * 1024;
 /// Auto-freeze never targets apps smaller than this.
 const MIN_FREEZE_MB: u64 = 100;
-/// One-liner the user runs to enable zswap for this boot (shown in the UI
-/// only when swap is NOT on zram).
-const ZSWAP_ENABLE_CMD: &str = "sudo sh -c 'echo Y > /sys/module/zswap/parameters/enabled'";
-/// zswap in front of zram compresses every page twice (lzo, then zstd),
-/// burns CPU on writeback and fails allocations under pressure. This turns
-/// it off now and drops the boot rule older Task Manager docs told users
-/// to create.
-const ZSWAP_DISABLE_CMD: &str = "sudo sh -c 'echo N > /sys/module/zswap/parameters/enabled; rm -f /etc/tmpfiles.d/zswap.conf'";
 /// Squeeze target while frozen: clamp(current/4, SQUEEZE_MIN, SQUEEZE_MAX).
 const SQUEEZE_MIN_BYTES: u64 = 96 * 1024 * 1024;
 const SQUEEZE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+/// Longest string field handed to the QML (titles, names, units).
+const FIELD_CAP: usize = 256;
+/// Most rows of each list in the state JSON.
+const MAX_APPS: usize = 256;
+const MAX_CLIENTS: usize = 1024;
+/// Read caps for kernel files.
+const CAP_DEFAULT: u64 = 1024 * 1024;
+const CAP_STATUS: u64 = 64 * 1024;
+const CAP_CMDLINE: u64 = 256 * 1024;
 
 /// Never touch the compositor, shell, audio stack, or terminals (a frozen
 /// terminal would freeze the shell/agent running inside it).
@@ -64,50 +71,71 @@ const EXCLUDE_COMMS: &[&str] = &[
     "bash",
     "zsh",
     "fish",
+    "task-manager",
 ];
 
-fn runtime_dir() -> String {
-    env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| format!("/run/user/{}", current_uid()))
-}
-
 fn current_uid() -> u32 {
-    // No libc dep for one number: read the owner uid of /proc/self.
-    use std::os::unix::fs::MetadataExt;
-    fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(1000)
+    sys::uid()
 }
 
-fn live_sig() -> String {
-    let rd = runtime_dir();
-    let cur = env::var("HYPRLAND_INSTANCE_SIGNATURE").unwrap_or_default();
-    if !cur.is_empty() && Path::new(&format!("{rd}/hypr/{cur}/.socket.sock")).exists() {
-        return cur;
+fn runtime() -> Option<safefs::Dir> {
+    match safefs::runtime() {
+        Ok(d) => Some(d),
+        Err(e) => {
+            eprintln!("task-manager: runtime dir unavailable: {e}");
+            None
+        }
     }
-    if let Ok(entries) = fs::read_dir(format!("{rd}/hypr")) {
-        let mut names: Vec<String> = entries
-            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
-            .collect();
-        names.sort();
-        for n in names {
-            if Path::new(&format!("{rd}/hypr/{n}/.socket.sock")).exists() {
-                return n;
+}
+
+fn state_dir() -> Option<safefs::Dir> {
+    match safefs::state() {
+        Ok(d) => Some(d),
+        Err(e) => {
+            eprintln!("task-manager: state dir unavailable: {e}");
+            None
+        }
+    }
+}
+
+/// Truncate to FIELD_CAP chars (char boundary safe).
+fn cap_str(s: &str) -> String {
+    s.chars().take(FIELD_CAP).collect()
+}
+
+/// Run a helper with a deadline; stdout/stderr discarded. Returns success.
+fn run_bounded(prog: &str, args: &[&str], secs: u64) -> bool {
+    let Ok(mut child) = Command::new(prog)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return st.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
             }
         }
     }
-    cur
 }
 
-fn hyprctl(args: &[&str]) -> String {
-    // timeout(1): a hung compositor must not stall the watch loop.
-    let out = Command::new("timeout")
-        .arg("2")
-        .arg("hyprctl")
-        .args(args)
-        .env("HYPRLAND_INSTANCE_SIGNATURE", live_sig())
-        .output();
-    match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(_) => String::new(),
-    }
+/// Fire-and-forget helper (notifications), reaped off-thread, bounded.
+fn spawn_bounded(prog: &'static str, args: Vec<String>, secs: u64) {
+    std::thread::spawn(move || {
+        let a: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_bounded(prog, &a, secs);
+    });
 }
 
 #[derive(Clone)]
@@ -115,6 +143,8 @@ struct Win {
     pid: u64,
     address: String,
     title: String,
+    /// Window class (app id): the card looks up the app's icon with it.
+    class: String,
     x: i64,
     y: i64,
     w: i64,
@@ -127,13 +157,13 @@ struct Win {
 /// (name, active workspace id, x, y) per monitor, in hyprctl order
 /// (client.monitor is an index into this array).
 fn monitors() -> Vec<(String, i64, i64, i64, bool, i64, i64)> {
-    let text = hyprctl(&["monitors", "-j"]);
-    let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&text) else {
+    let Some(Value::Array(arr)) = hypr::query("monitors") else {
         return Vec::new();
     };
     arr.iter()
+        .take(64)
         .filter_map(|m| {
-            let name = m.get("name")?.as_str()?.to_string();
+            let name = cap_str(m.get("name")?.as_str()?);
             let ws = m
                 .get("activeWorkspace")
                 .and_then(|w| w.get("id"))
@@ -150,11 +180,11 @@ fn monitors() -> Vec<(String, i64, i64, i64, bool, i64, i64)> {
 }
 
 fn clients(mons: &[(String, i64, i64, i64, bool, i64, i64)]) -> Vec<Win> {
-    let text = hyprctl(&["clients", "-j"]);
-    let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&text) else {
+    let Some(Value::Array(arr)) = hypr::query("clients") else {
         return Vec::new();
     };
     arr.iter()
+        .take(MAX_CLIENTS)
         .filter(|c| c.get("mapped").and_then(Value::as_bool).unwrap_or(true))
         .filter_map(|c| {
             let at = c.get("at")?.as_array()?;
@@ -167,13 +197,24 @@ fn clients(mons: &[(String, i64, i64, i64, bool, i64, i64)]) -> Vec<Win> {
             };
             Some(Win {
                 pid: c.get("pid")?.as_u64()?,
-                address: c.get("address")?.as_str()?.to_string(),
+                address: c
+                    .get("address")?
+                    .as_str()
+                    .filter(|a| hypr::valid_address(a))?
+                    .to_string(),
                 title: c
                     .get("title")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .chars()
                     .take(60)
+                    .collect(),
+                class: c
+                    .get("class")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .chars()
+                    .take(128)
                     .collect(),
                 x: at.first().and_then(Value::as_i64).unwrap_or(0),
                 y: at.get(1).and_then(Value::as_i64).unwrap_or(0),
@@ -191,8 +232,14 @@ fn clients(mons: &[(String, i64, i64, i64, bool, i64, i64)]) -> Vec<Win> {
         .collect()
 }
 
+/// Bounded read of a kernel file (/proc, /sys), trimmed.
 fn read_trim(path: &str) -> Option<String> {
-    fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+    read_capped(path, CAP_DEFAULT)
+}
+
+fn read_capped(path: &str, cap: u64) -> Option<String> {
+    let b = safefs::read_kernel(path, cap)?;
+    Some(String::from_utf8_lossy(&b).trim().to_string())
 }
 
 fn proc_cgroup(pid: u64) -> Option<(String, String)> {
@@ -213,23 +260,61 @@ fn unit_procs(cgpath: &str) -> Vec<u64> {
 }
 
 fn rss_kb(pid: u64) -> u64 {
-    let Some(status) = read_trim(&format!("/proc/{pid}/status")) else {
-        return 0;
-    };
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
-            return rest
-                .split_whitespace()
-                .next()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-        }
-    }
-    0
+    status_kb(pid).0
 }
 
 fn comm(pid: u64) -> String {
-    read_trim(&format!("/proc/{pid}/comm")).unwrap_or_else(|| "?".into())
+    with_pid(pid, |e| {
+        e.comm
+            .get_or_insert_with(|| read_trim(&format!("/proc/{pid}/comm")).unwrap_or_else(|| "?".into()))
+            .clone()
+    })
+}
+
+/// (VmRSS, VmSwap) in kB, from one read of /proc/PID/status.
+fn status_kb(pid: u64) -> (u64, u64) {
+    with_pid(pid, |e| {
+        *e.status.get_or_insert_with(|| {
+            let Some(s) = read_capped(&format!("/proc/{pid}/status"), CAP_STATUS) else {
+                return (0, 0);
+            };
+            let field = |k: &str| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix(k))
+                    .and_then(|v| v.split_whitespace().next())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0)
+            };
+            (field("VmRSS:"), field("VmSwap:"))
+        })
+    })
+}
+
+/// Per-pid memo, dropped wholesale after PID_TTL. One tick asks for the
+/// same comm/status from several places (governor, background groups,
+/// history); reading /proc once per pid per tick keeps the watchdog cheap.
+const PID_TTL: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[derive(Default)]
+struct PidMemo {
+    comm: Option<String>,
+    status: Option<(u64, u64)>,
+}
+
+thread_local! {
+    static PIDS: std::cell::RefCell<(Option<std::time::Instant>, BTreeMap<u64, PidMemo>)> =
+        const { std::cell::RefCell::new((None, BTreeMap::new())) };
+}
+
+fn with_pid<R>(pid: u64, f: impl FnOnce(&mut PidMemo) -> R) -> R {
+    PIDS.with(|c| {
+        let mut c = c.borrow_mut();
+        if !matches!(c.0, Some(t) if t.elapsed() < PID_TTL) {
+            c.0 = Some(std::time::Instant::now());
+            c.1.clear();
+        }
+        f(c.1.entry(pid).or_default())
+    })
 }
 
 fn scope_frozen(cgpath: &str) -> bool {
@@ -249,87 +334,99 @@ fn pid_stopped(pid: u64) -> bool {
 }
 
 /// Marker file: what WE froze. Apps that stop themselves (state T on their
-/// own) must not show up as paused by us. Unit markers ALSO cover the async
+/// own) must not show up as paused by us. Scope markers ALSO cover the async
 /// cgroup.freeze transition window (freeze=0 until fully frozen, so right
 /// after a freeze the row would vanish if its RSS already squeezed low).
-fn marker_path() -> String {
-    format!("{}/tm-frozen.json", runtime_dir())
+/// Pids are stored with their start time, so a reused pid is never "ours".
+const MARKER: &str = "frozen.json";
+
+struct Marker {
+    pids: Vec<(u64, u64)>,
+    scopes: Vec<String>,
 }
 
-fn marker_read() -> (Vec<u64>, Vec<String>) {
-    let Some(text) = read_trim(&marker_path()) else {
-        return (Vec::new(), Vec::new());
+fn marker_read() -> Marker {
+    let mut m = Marker { pids: Vec::new(), scopes: Vec::new() };
+    let Some(text) = runtime().and_then(|d| d.read_string(MARKER)) else {
+        return m;
     };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else {
-        return (Vec::new(), Vec::new());
+    let Ok(v) = json::from_str(&text) else {
+        return m;
     };
-    let pids = v
-        .get("pids")
-        .and_then(|p| p.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_u64()).collect())
-        .unwrap_or_default();
-    let units = v
-        .get("units")
-        .and_then(|p| p.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    (pids, units)
+    if let Some(a) = v.get("pids").and_then(Value::as_array) {
+        m.pids = a
+            .iter()
+            .take(4096)
+            .filter_map(|x| Some((x[0].as_u64()?, x[1].as_u64()?)))
+            .collect();
+    }
+    if let Some(a) = v.get("scopes").and_then(Value::as_array) {
+        m.scopes = a
+            .iter()
+            .take(4096)
+            .filter_map(|x| x.as_str().filter(|p| cg_path_ok(p)).map(str::to_string))
+            .collect();
+    }
+    m
 }
 
+fn marker_write(m: &Marker) {
+    let pids: Vec<Value> = m
+        .pids
+        .iter()
+        .map(|(p, s)| Value::Array(vec![json!(*p), json!(*s)]))
+        .collect();
+    let scopes: Vec<Value> = m.scopes.iter().map(|s| json!(s)).collect();
+    let v = json!({"pids": pids, "scopes": scopes});
+    if let Some(d) = runtime() {
+        let _ = d.write_atomic(MARKER, v.to_string().as_bytes());
+    }
+}
+
+/// Pids we stopped that are still the same processes.
 fn marker_pids() -> Vec<u64> {
-    marker_read().0
+    marker_read()
+        .pids
+        .into_iter()
+        .filter(|(p, s)| start_time(*p) == Some(*s))
+        .map(|(p, _)| p)
+        .collect()
 }
 
 fn marker_units() -> Vec<String> {
-    marker_read().1
+    marker_read().scopes.iter().map(|p| unit_of(p)).collect()
 }
 
-fn marker_write(pids: &[u64], units: &[String]) {
-    let pl: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
-    let ul: Vec<String> = units
-        .iter()
-        .map(|u| format!("\"{}\"", json_escape(u)))
-        .collect();
-    let _ = fs::write(
-        marker_path(),
-        format!(
-            "{{\"pids\":[{}],\"units\":[{}]}}",
-            pl.join(","),
-            ul.join(",")
-        ),
-    );
+fn unit_of(cgpath: &str) -> String {
+    cgpath.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string()
 }
 
 fn marker_add(pid: u64) {
-    let (mut p, u) = marker_read();
-    if !p.contains(&pid) {
-        p.push(pid);
-    }
-    marker_write(&p, &u);
+    let Some(st) = start_time(pid) else { return };
+    let mut m = marker_read();
+    m.pids.retain(|(p, _)| *p != pid);
+    m.pids.push((pid, st));
+    marker_write(&m);
 }
 
 fn marker_remove(pid: u64) {
-    let (p, u) = marker_read();
-    let p: Vec<u64> = p.into_iter().filter(|x| *x != pid).collect();
-    marker_write(&p, &u);
+    let mut m = marker_read();
+    m.pids.retain(|(p, _)| *p != pid);
+    marker_write(&m);
 }
 
-fn marker_add_unit(unit: &str) {
-    let (p, mut u) = marker_read();
-    if !u.iter().any(|x| x == unit) {
-        u.push(unit.to_string());
+fn marker_add_scope(cgpath: &str) {
+    let mut m = marker_read();
+    if !m.scopes.iter().any(|x| x == cgpath) {
+        m.scopes.push(cgpath.to_string());
     }
-    marker_write(&p, &u);
+    marker_write(&m);
 }
 
-fn marker_remove_unit(unit: &str) {
-    let (p, u) = marker_read();
-    let u: Vec<String> = u.into_iter().filter(|x| x != unit).collect();
-    marker_write(&p, &u);
+fn marker_remove_scope(cgpath: &str) {
+    let mut m = marker_read();
+    m.scopes.retain(|x| x != cgpath);
+    marker_write(&m);
 }
 
 fn mem_current(cgpath: &str) -> u64 {
@@ -338,18 +435,63 @@ fn mem_current(cgpath: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Our delegated cgroup subtree (relative to CGROOT).
+fn user_root() -> String {
+    format!(
+        "/user.slice/user-{uid}.slice/user@{uid}.service",
+        uid = current_uid()
+    )
+}
+
+/// Only cgroups inside our own delegated subtree are ever written.
+fn cg_path_ok(cgpath: &str) -> bool {
+    cgpath.starts_with(&format!("{}/", user_root()))
+        && !cgpath.split('/').any(|c| c == ".." || c == ".")
+        && !cgpath.contains('\0')
+}
+
+/// Write a control file of one of our cgroups (no symlink following).
+fn cg_write(cgpath: &str, file: &str, value: &str) -> bool {
+    cg_path_ok(cgpath) && safefs::write_kernel(&format!("{CGROOT}{cgpath}/{file}"), value)
+}
+
 fn set_memory_high(cgpath: &str, value: &str) {
-    let _ = fs::write(format!("{CGROOT}{cgpath}/memory.high"), value);
+    let _ = cg_write(cgpath, "memory.high", value);
 }
 
-fn systemctl_user(args: &[&str]) {
-    let mut full = vec!["--user"];
-    full.extend_from_slice(args);
-    let _ = Command::new("systemctl").args(&full).output();
+/// Signal a process through a pidfd. With `start`, only if it is still the
+/// process that started then (the pidfd pins it, so check-then-signal on
+/// it cannot hit a reused pid).
+fn signal(pid: u64, start: Option<u64>, signo: i32) -> bool {
+    let Ok(fd) = sys::Pidfd::open(pid) else {
+        return false;
+    };
+    let Some(now) = start_time(pid) else {
+        return false;
+    };
+    if start.is_some_and(|s| s != now) {
+        return false;
+    }
+    fd.signal(signo)
 }
 
-fn sig(pid: u64, sig: &str) {
-    let _ = Command::new("kill").args([sig, &pid.to_string()]).output();
+/// Signal a family member found by a /proc scan: pinned first, then
+/// re-checked to still carry the family's comm and our uid.
+fn signal_member(pid: u64, family_comm: &str, signo: i32) -> bool {
+    let Ok(fd) = sys::Pidfd::open(pid) else {
+        return false;
+    };
+    if comm(pid) != family_comm || !owned_by_us(pid) {
+        return false;
+    }
+    fd.signal(signo)
+}
+
+fn owned_by_us(pid: u64) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(format!("/proc/{pid}"))
+        .map(|m| m.uid() == current_uid())
+        .unwrap_or(false)
 }
 
 fn zswap_status() -> (bool, bool, bool) {
@@ -360,7 +502,7 @@ fn zswap_status() -> (bool, bool, bool) {
     let zram = read_trim("/proc/swaps")
         .map(|s| s.lines().skip(1).any(|l| l.contains("zram")))
         .unwrap_or(false);
-    if !Path::new(p).exists() {
+    if !std::path::Path::new(p).exists() {
         return (false, false, zram);
     }
     let enabled = read_trim(p).as_deref() == Some("Y");
@@ -369,9 +511,18 @@ fn zswap_status() -> (bool, bool, bool) {
 
 /// Read a numeric UI pref from prefs.json (written by `pref K V`).
 fn pref_num(key: &str, dflt: f64) -> f64 {
-    let cur = read_prefs();
-    let v: Value = serde_json::from_str(&cur).unwrap_or_else(|_| serde_json::json!({}));
-    v.get(key).and_then(|x| x.as_f64()).unwrap_or(dflt)
+    let v = read_prefs();
+    match v.get(key) {
+        Some(Value::Bool(b)) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        Some(x) => x.as_f64().unwrap_or(dflt),
+        None => dflt,
+    }
 }
 
 /// Pressure thresholds (prefs-backed; env still wins, for testing).
@@ -490,17 +641,17 @@ fn mem_info() -> (u64, u64, f64, f64, u64, u64) {
     )
 }
 
+/// Escaped JSON string CONTENT (no quotes), truncated to FIELD_CAP chars,
+/// for the hand-built state output.
 fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', " ")
-        .replace('\r', " ")
+    let q = json::quote(&cap_str(s));
+    q[1..q.len() - 1].to_string()
 }
 
 fn win_json(w: &Win) -> String {
     format!(
         "{{\"addr\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"ws\":{},\"mon\":\"{}\",\"pinned\":{},\"title\":\"{}\"}}",
-        w.address,
+        json_escape(&w.address),
         w.x,
         w.y,
         w.w,
@@ -516,7 +667,7 @@ fn win_json(w: &Win) -> String {
 /// children all share the parent's comm; the --type flag is what
 /// distinguishes a tab renderer from the GPU process or network service.
 fn proc_role(pid: u64) -> String {
-    let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) else {
+    let Some(raw) = safefs::read_kernel(&format!("/proc/{pid}/cmdline"), CAP_CMDLINE) else {
         return String::new();
     };
     let s = String::from_utf8_lossy(&raw).replace('\0', " ");
@@ -550,13 +701,40 @@ fn proc_role(pid: u64) -> String {
 /// All user pids sharing a comm (the app's full "family", across scopes —
 /// chrome splits into 2+ scopes; the tree/freeze must treat it as ONE app).
 fn comm_family(pid: u64) -> Vec<u64> {
-    use std::os::unix::fs::MetadataExt;
     let target = comm(pid);
+    let mut out = FAMILIES.with(|f| {
+        let mut f = f.borrow_mut();
+        let fresh = matches!(&*f, Some((t, _)) if t.elapsed() < FAMILY_TTL);
+        if !fresh {
+            *f = Some((std::time::Instant::now(), user_comms()));
+        }
+        f.as_ref()
+            .and_then(|(_, m)| m.get(&target).cloned())
+            .unwrap_or_default()
+    });
+    if out.is_empty() {
+        out.push(pid);
+    }
+    out
+}
+
+/// One /proc pass grouping the user's pids by comm. Callers ask for many
+/// families per tick (every window, every background group): scanning /proc
+/// once per family made the watchdog O(apps × procs).
+const FAMILY_TTL: std::time::Duration = std::time::Duration::from_millis(250);
+
+thread_local! {
+    static FAMILIES: std::cell::RefCell<Option<(std::time::Instant, BTreeMap<String, Vec<u64>>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn user_comms() -> BTreeMap<String, Vec<u64>> {
+    use std::os::unix::fs::MetadataExt;
     let uid = current_uid();
     let self_pid = std::process::id() as u64;
-    let mut out = Vec::new();
+    let mut map: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     let Ok(entries) = fs::read_dir("/proc") else {
-        return vec![pid];
+        return map;
     };
     for e in entries.flatten() {
         let Some(p) = e.file_name().to_str().and_then(|s| s.parse::<u64>().ok()) else {
@@ -571,14 +749,9 @@ fn comm_family(pid: u64) -> Vec<u64> {
         if md.uid() != uid {
             continue;
         }
-        if comm(p) == target {
-            out.push(p);
-        }
+        map.entry(comm(p)).or_default().push(p);
     }
-    if out.is_empty() {
-        out.push(pid);
-    }
-    out
+    map
 }
 
 /// Unique app-scope (cgpath, unit) pairs covering a process family.
@@ -608,13 +781,7 @@ struct BgRec {
 
 /// Per-process swap usage (VmSwap, kB) — cheap status read.
 fn swap_kb(pid: u64) -> u64 {
-    let Ok(s) = fs::read_to_string(format!("/proc/{pid}/status")) else {
-        return 0;
-    };
-    s.lines()
-        .find_map(|l| l.strip_prefix("VmSwap:"))
-        .and_then(|v| v.trim().trim_end_matches(" kB").parse::<u64>().ok())
-        .unwrap_or(0)
+    status_kb(pid).1
 }
 
 fn collect_background(by_pid: &BTreeMap<u64, Vec<Win>>, marks: &[u64]) -> Vec<BgRec> {
@@ -707,6 +874,12 @@ fn windowed_set_contains(by_pid: &BTreeMap<u64, Vec<Win>>, pid: u64) -> bool {
 /// sorted by RSS. Informational only — we cannot (and must not) signal
 /// foreign pids, so the UI renders no action buttons for these rows.
 fn collect_system(by_pid: &BTreeMap<u64, Vec<Win>>) -> Vec<BgRec> {
+    system_groups(by_pid).into_iter().map(|(r, _)| r).collect()
+}
+
+/// The top system groups with every pid of each: the history sums their
+/// CPU (comm_family only knows the user's own pids).
+fn system_groups(by_pid: &BTreeMap<u64, Vec<Win>>) -> Vec<(BgRec, Vec<u64>)> {
     use std::os::unix::fs::MetadataExt;
     let uid = current_uid();
     let self_pid = std::process::id() as u64;
@@ -744,27 +917,32 @@ fn collect_system(by_pid: &BTreeMap<u64, Vec<Win>>) -> Vec<BgRec> {
         g.0 += r;
         g.1.push(pid);
     }
-    let mut out: Vec<BgRec> = groups
+    let mut out: Vec<(BgRec, Vec<u64>)> = groups
         .into_iter()
-        .map(|(name, (rkb, pids))| BgRec {
-            name,
-            rss_mb: rkb / 1024,
-            swap_mb: 0, // system daemons: informational only, no swap tally
-            procs: pids.len(),
-            pid: pids.iter().copied().max().unwrap_or(0),
-            unit: String::new(),
-            mechanism: "signal",
-            frozen: false,
+        .map(|(name, (rkb, pids))| {
+            let rec = BgRec {
+                name,
+                rss_mb: rkb / 1024,
+                swap_mb: 0, // system daemons: informational only, no swap tally
+                procs: pids.len(),
+                pid: pids.iter().copied().max().unwrap_or(0),
+                unit: String::new(),
+                mechanism: "signal",
+                frozen: false,
+            };
+            (rec, pids)
         })
         .collect();
-    out.sort_by(|a, b| b.rss_mb.cmp(&a.rss_mb));
+    out.sort_by(|a, b| b.0.rss_mb.cmp(&a.0.rss_mb));
     // Keep it short: this section shares the scroll viewport with the app
     // list — 6 top offenders usually fit without pushing it below the fold.
     out.truncate(6);
     out
 }
 
-fn cmd_state() {
+/// `brief`: windowed apps only (no background/system scans) for the polls
+/// while the card is closed: the veils and the pill need nothing else.
+fn cmd_state(brief: bool) {
     let mons = monitors();
     let mut by_pid: BTreeMap<u64, Vec<Win>> = BTreeMap::new();
     for w in clients(&mons) {
@@ -812,6 +990,7 @@ fn cmd_state() {
         ));
     }
     apps.sort_by(|a, b| b.3.cmp(&a.3));
+    apps.truncate(MAX_APPS);
 
     let mut out = String::from("\"apps\":[");
     let mut first = true;
@@ -820,28 +999,22 @@ fn cmd_state() {
             out.push(',');
         }
         first = false;
-        let wins_json: Vec<String> = wins.iter().map(win_json).collect();
-        // Browser families get the live tab list reported by the companion
-        // extension (written to the cache by `tabs-host`); others get [].
+        let wins_json: Vec<String> = wins.iter().take(64).map(win_json).collect();
         let c = comm(*pid);
-        let tabs_json = if is_browser_comm(&c) {
-            tabs_cache_json()
-        } else {
-            "[]".to_string()
-        };
         out.push_str(&format!(
-            "{{\"pid\":{pid},\"name\":\"{}\",\"title\":\"{}\",\"rss_mb\":{rss_mb},\"unit\":\"{}\",\"mechanism\":\"{mechanism}\",\"frozen\":{frozen},\"windows\":{},\"procs\":{nprocs},\"wins\":[{}],\"tabs\":{}}}",
+            "{{\"pid\":{pid},\"start\":{},\"name\":\"{}\",\"title\":\"{}\",\"class\":\"{}\",\"rss_mb\":{rss_mb},\"unit\":\"{}\",\"mechanism\":\"{mechanism}\",\"frozen\":{frozen},\"windows\":{},\"procs\":{nprocs},\"wins\":[{}]}}",
+            start_time(*pid).unwrap_or(0),
             json_escape(&c),
             json_escape(&wins[0].title),
+            json_escape(&wins[0].class),
             json_escape(unit),
             wins.len(),
-            wins_json.join(","),
-            tabs_json
+            wins_json.join(",")
         ));
     }
     out.push(']');
 
-    let background = collect_background(&by_pid, &our_marks);
+    let background = if brief { Vec::new() } else { collect_background(&by_pid, &our_marks) };
     let mut bg_json = String::from("\"background\":[");
     let mut first = true;
     for b in &background {
@@ -850,8 +1023,9 @@ fn cmd_state() {
         }
         first = false;
         bg_json.push_str(&format!(
-            "{{\"pid\":{},\"name\":\"{}\",\"rss_mb\":{},\"swap_mb\":{},\"procs\":{},\"unit\":\"{}\",\"mechanism\":\"{}\",\"frozen\":{}}}",
+            "{{\"pid\":{},\"start\":{},\"name\":\"{}\",\"rss_mb\":{},\"swap_mb\":{},\"procs\":{},\"unit\":\"{}\",\"mechanism\":\"{}\",\"frozen\":{}}}",
             b.pid,
+            start_time(b.pid).unwrap_or(0),
             json_escape(&b.name),
             b.rss_mb,
             b.swap_mb,
@@ -864,7 +1038,7 @@ fn cmd_state() {
     bg_json.push(']');
 
     // System daemons (not ours): same row shape, no actionable fields.
-    let system = collect_system(&by_pid);
+    let system = if brief { Vec::new() } else { collect_system(&by_pid) };
     let mut sys_json = String::from("\"system\":[");
     let mut first = true;
     for s in &system {
@@ -873,8 +1047,9 @@ fn cmd_state() {
         }
         first = false;
         sys_json.push_str(&format!(
-            "{{\"pid\":{},\"name\":\"{}\",\"rss_mb\":{},\"procs\":{}}}",
+            "{{\"pid\":{},\"start\":{},\"name\":\"{}\",\"rss_mb\":{},\"procs\":{}}}",
             s.pid,
+            start_time(s.pid).unwrap_or(0),
             json_escape(&s.name),
             s.rss_mb,
             s.procs
@@ -899,7 +1074,7 @@ fn cmd_state() {
         Some((c, m)) => format!("{{\"cpu\":{c:.1},\"mem\":{m:.1}}}"),
         None => "null".to_string(),
     };
-    let prefs = read_prefs();
+    let prefs = read_prefs().to_string();
 
     // Suggestions: evidence-based, each with an optional one-click action.
     let mut sug: Vec<String> = Vec::new();
@@ -907,108 +1082,42 @@ fn cmd_state() {
         // Fully-swapped sleeper: the idle-llama-server pattern. Tiny RSS,
         // big swap — closing it returns the swap immediately.
         if !b.frozen && b.swap_mb >= 200 && b.rss_mb <= 100 {
-            sug.push(format!(
-                "{{\"kind\":\"sleeper\",\"text\":\"{} lleva {} MB dormido en swap — cerrarlo libera esa memoria\",\"action\":\"kill\",\"pid\":{}}}",
-                json_escape(&b.name),
-                b.swap_mb,
-                b.pid
-            ));
-        }
-    }
-    // Browser tabs: many idle background tabs → one-click discard-all.
-    let tabs_raw = tabs_cache_json();
-    if let Ok(v) = serde_json::from_str::<Value>(&tabs_raw) {
-        if let Some(tabs) = v.as_array() {
-            let idle = tabs
-                .iter()
-                .filter(|t| {
-                    t.get("active").and_then(|a| a.as_bool()) == Some(false)
-                        && t.get("discarded").and_then(|d| d.as_bool()) == Some(false)
+            let Some(st) = start_time(b.pid) else { continue };
+            sug.push(
+                json!({
+                    "kind": "sleeper",
+                    "name": cap_str(&b.name),
+                    "swap_mb": b.swap_mb,
+                    "text": format!(
+                        "{} has {} MB asleep in swap; closing it frees that memory",
+                        cap_str(&b.name),
+                        b.swap_mb
+                    ),
+                    "action": "kill",
+                    "pid": b.pid,
+                    "start": st
                 })
-                .count();
-            if idle >= 8 {
-                sug.push(format!(
-                    "{{\"kind\":\"tabs\",\"text\":\"{} pestañas en segundo plano — descargarlas libera su memoria (recargan al enfocarlas)\",\"action\":\"discard-bg\",\"pid\":0}}",
-                    idle
-                ));
-            }
+                .to_string(),
+            );
         }
-    }
-    // zswap stacked on zram: double compression (see ZSWAP_DISABLE_CMD).
-    if zswap_on && zram_backed {
-        sug.push(
-            "{\"kind\":\"zswap\",\"text\":\"zswap está activo encima de zram: cada página se comprime dos veces y falla al reclamar bajo presión. Copia el comando para apagarlo\",\"action\":\"run\",\"cmd\":\"zswap-copy\",\"pid\":0}".to_string(),
-        );
-    }
-    // Stale /tmp trees: tmpfs files are RAM that no reclaim can free.
-    let hyg = hygiene::report();
-    let stale_mb = hyg.get("tmp_stale_mb").and_then(|v| v.as_u64()).unwrap_or(0);
-    if stale_mb >= hygiene::TMP_SUGGEST_MIN_MB {
-        let n = hyg.get("tmp_stale_count").and_then(|v| v.as_u64()).unwrap_or(0);
-        let top: Vec<String> = hyg
-            .get("tmp_stale_top")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .take(3)
-                    .filter_map(|e| {
-                        let p = e.get("path")?.as_str()?;
-                        Some(format!("{} ({} MB)", p.trim_start_matches("/tmp/"), e.get("mb")?.as_u64()?))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let more = n.saturating_sub(top.len() as u64);
-        let list = if more > 0 {
-            format!("{} y {more} más", top.join(", "))
-        } else {
-            top.join(", ")
-        };
-        // serde builds it: /tmp names may hold any byte json_escape misses.
-        // confirm = the UI asks for a second click; clean-tmp only deletes
-        // what this report listed.
-        sug.push(
-            serde_json::json!({
-                "kind": "tmp",
-                "text": format!("/tmp retiene {stale_mb} MB de RAM en {n} elementos sin uso hace más de 24 h ({list}). Borrarlos libera esa memoria"),
-                "action": "run",
-                "cmd": "clean-tmp",
-                "confirm": true,
-                "pid": 0
-            })
-            .to_string(),
-        );
-    }
-    // Browser Memory Saver: the one tab-discarding path Linux has (no OS
-    // memory-pressure signal reaches Chrome here, unlike macOS/Windows).
-    let saver = browser::status();
-    if saver == Some(false) && apps.iter().any(|a| is_browser_comm(&comm(a.0))) {
-        sug.push(
-            serde_json::json!({
-                "kind": "memory-saver",
-                "text": "En macOS, Chrome descarta pestañas cuando falta memoria; en Linux no recibe ese aviso y su Ahorro de memoria viene apagado. Actívalo para que libere las pestañas inactivas",
-                "action": "run",
-                "cmd": "chrome-memory-saver",
-                "pid": 0
-            })
-            .to_string(),
-        );
     }
     // Governor at work: say what is being held back, so slow builds are
     // explained instead of looking broken.
-    let gov: Value = serde_json::from_str(&governor::status_json()).unwrap_or(Value::Null);
+    let gov: Value = json::from_str(&governor::status_json()).unwrap_or(Value::Null);
     if let Some(lim) = gov.get("limited").and_then(|v| v.as_array()) {
         if !lim.is_empty() {
             let names: Vec<String> = lim
                 .iter()
                 .take(3)
-                .filter_map(|e| Some(format!("{} ≤{} MB", e.get("name")?.as_str()?, e.get("high_mb")?.as_u64()?)))
+                .filter_map(|e| Some(format!("{} ≤{} MB", cap_str(e.get("name")?.as_str()?), e.get("high_mb")?.as_u64()?)))
                 .collect();
             sug.push(
-                serde_json::json!({
+                json!({
                     "kind": "governor",
+                    "count": lim.len(),
+                    "names": names.join(", "),
                     "text": format!(
-                        "Conteniendo {} proceso(s) en segundo plano para que el escritorio siga fluido: {}",
+                        "Holding back {} background process(es) to keep the desktop smooth: {}",
                         lim.len(),
                         names.join(", ")
                     ),
@@ -1021,17 +1130,13 @@ fn cmd_state() {
     }
     if avail_pct < 25.0 {
         sug.push(
-            "{\"kind\":\"pressure\",\"text\":\"Presión de memoria alta — pausa las apps que no estés usando\",\"action\":\"none\",\"pid\":0}".to_string(),
+            "{\"kind\":\"pressure\",\"text\":\"Memory pressure is high: pause the apps you are not using\",\"action\":\"none\",\"pid\":0}".to_string(),
         );
     }
     let sug_json = format!("\"suggestions\":[{}]", sug.join(","));
-    let saver_json = match saver {
-        Some(b) => b.to_string(),
-        None => "null".to_string(),
-    };
     let gov_json = if gov.is_null() { "null".to_string() } else { gov.to_string() };
     println!(
-        "{{\"mem\":{{\"total_mb\":{total},\"avail_mb\":{avail},\"psi_some10\":{psi:.2},\"swap_total_mb\":{swap_total},\"swap_used_mb\":{swap_used}}},\"pressure\":{{\"avail_pct\":{avail_pct:.1},\"critical\":{critical}}},\"zswap\":{{\"available\":{zswap_avail},\"enabled\":{zswap_on},\"zram\":{zram_backed}}},\"governor\":{gov_json},\"hygiene\":{hyg},\"memory_saver\":{saver_json},\"now\":{now_json},\"prefs\":{prefs},\"monitors\":[{}],{out},{bg_json},{sys_json},{sug_json}}}",
+        "{{\"engine\":\"rust\",\"mem\":{{\"total_mb\":{total},\"avail_mb\":{avail},\"psi_some10\":{psi:.2},\"swap_total_mb\":{swap_total},\"swap_used_mb\":{swap_used}}},\"pressure\":{{\"avail_pct\":{avail_pct:.1},\"critical\":{critical}}},\"zswap\":{{\"available\":{zswap_avail},\"enabled\":{zswap_on},\"zram\":{zram_backed}}},\"governor\":{gov_json},\"now\":{now_json},\"prefs\":{prefs},\"monitors\":[{}],{out},{bg_json},{sys_json},{sug_json}}}",
         mons_json.join(",")
     );
 }
@@ -1049,20 +1154,63 @@ fn app_windows(pid: u64) -> Vec<Win> {
         .collect()
 }
 
-fn cmd_freeze(pid: u64) {
+/// A command's process argument: `PID` or `PID:START`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Target {
+    pid: u64,
+    start: Option<u64>,
+}
+
+fn parse_target(arg: &str) -> Option<Target> {
+    let (p, s) = match arg.split_once(':') {
+        Some((p, s)) => (p, Some(s)),
+        None => (arg, None),
+    };
+    if p.is_empty() || !p.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let pid: u64 = p.parse().ok().filter(|p| *p > 1 && *p <= i32::MAX as u64)?;
+    let start = match s {
+        Some(s) if !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()) => Some(s.parse().ok()?),
+        Some(_) => return None,
+        None => None,
+    };
+    Some(Target { pid, start })
+}
+
+/// The pid must still name the process the caller saw: pinned with a pidfd
+/// first, then compared by start time. Returns the verified start time;
+/// exits 3 (doing nothing) when the process is gone or the pid was reused.
+fn verify(t: Target) -> u64 {
+    let pinned = sys::Pidfd::open(t.pid);
+    let now = start_time(t.pid);
+    match (pinned, now) {
+        (Ok(_), Some(now)) if t.start.is_none_or(|s| s == now) => now,
+        _ => {
+            eprintln!("task-manager: pid {} is gone or was reused; nothing done", t.pid);
+            std::process::exit(3);
+        }
+    }
+}
+
+/// Freeze an app family (cgroup freezer per scope, signals outside scopes).
+fn freeze_family(pid: u64) {
+    let c = comm(pid);
     let family = comm_family(pid);
     let scopes = family_scopes(&family);
     if scopes.is_empty() {
-        // No systemd scope: signal-stop every family member.
+        // No scope: signal-stop every family member.
         for p in &family {
-            sig(*p, "-STOP");
-            marker_add(*p);
+            if signal_member(*p, &c, sys::SIGSTOP) {
+                marker_add(*p);
+            }
         }
         return;
     }
-    for (cgpath, unit) in &scopes {
-        systemctl_user(&["freeze", unit]);
-        marker_add_unit(unit);
+    for (cgpath, _) in &scopes {
+        if cg_write(cgpath, "cgroup.freeze", "1") {
+            marker_add_scope(cgpath);
+        }
         // Squeeze: let the kernel reclaim the frozen app's cold pages.
         let cur = mem_current(cgpath);
         if cur > 0 {
@@ -1073,111 +1221,226 @@ fn cmd_freeze(pid: u64) {
     // Family members living outside any app scope: signal-stop them too.
     let scoped: Vec<u64> = scopes.iter().flat_map(|(cg, _)| unit_procs(cg)).collect();
     for p in &family {
-        if !scoped.contains(p) {
-            sig(*p, "-STOP");
+        if !scoped.contains(p) && signal_member(*p, &c, sys::SIGSTOP) {
             marker_add(*p);
         }
     }
 }
 
-fn cmd_thaw(pid: u64) {
+fn thaw_family(pid: u64) {
+    let c = comm(pid);
     let family = comm_family(pid);
     let scopes = family_scopes(&family);
-    for (cgpath, unit) in &scopes {
+    for (cgpath, _) in &scopes {
         // Restore headroom BEFORE resuming so the app can allocate.
         set_memory_high(cgpath, "max");
-        systemctl_user(&["thaw", unit]);
-        marker_remove_unit(unit);
+        cg_write(cgpath, "cgroup.freeze", "0");
+        marker_remove_scope(cgpath);
     }
-    if scopes.is_empty() {
-        for p in &family {
-            sig(*p, "-CONT");
-            marker_remove(*p);
-        }
-        return;
-    }
-    // Signal-stopped stragglers (outside scopes) get CONT as well.
     for p in &family {
-        if pid_stopped(*p) {
-            sig(*p, "-CONT");
+        // CONT is a no-op for running processes; stopped stragglers (or a
+        // scope-less family) resume.
+        if scopes.is_empty() || pid_stopped(*p) {
+            signal_member(*p, &c, sys::SIGCONT);
         }
         marker_remove(*p);
     }
 }
 
-fn cmd_focus(pid: u64) {
-    if let Some(w) = app_windows(pid).first() {
-        hyprctl(&[
-            "dispatch",
-            &format!(r#"hl.dsp.focus({{ window = "address:{}" }})"#, w.address),
-        ]);
+fn cmd_freeze(t: Target) {
+    verify(t);
+    freeze_family(t.pid);
+}
+
+fn cmd_thaw(t: Target) {
+    verify(t);
+    thaw_family(t.pid);
+}
+
+fn cmd_focus(t: Target) {
+    verify(t);
+    if let Some(w) = app_windows(t.pid).first() {
+        if hypr::valid_address(&w.address) {
+            hypr::dispatch(&format!(r#"hl.dsp.focus({{ window = "address:{}" }})"#, w.address));
+        }
     }
 }
 
-fn cmd_kill(pid: u64) {
+fn cmd_kill(t: Target) {
+    verify(t);
+    let c = comm(t.pid);
+    // Pin every member BEFORE anything changes: the TERM/KILL below then go
+    // to these exact processes, whatever pids the kernel hands out meanwhile.
+    let pinned: Vec<sys::Pidfd> = comm_family(t.pid)
+        .into_iter()
+        .filter_map(|p| {
+            let fd = sys::Pidfd::open(p).ok()?;
+            (comm(p) == c && owned_by_us(p)).then_some(fd)
+        })
+        .collect();
     // A frozen process cannot handle SIGTERM until resumed.
-    let family = comm_family(pid);
-    cmd_thaw(pid);
-    for p in &family {
-        sig(*p, "-TERM");
+    thaw_family(t.pid);
+    for fd in &pinned {
+        fd.signal(sys::SIGTERM);
+    }
+    kill_survivors(&pinned);
+}
+
+/// starttime (field 22) from the text of /proc/PID/stat; None for zombies.
+fn parse_starttime(stat: &str) -> Option<u64> {
+    let rest = stat.get(stat.rfind(')')? + 1..)?;
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    if matches!(f.first(), Some(&"Z") | Some(&"X")) {
+        return None; // dead, waiting to be reaped
+    }
+    f.get(19)?.parse().ok()
+}
+
+/// Start time (clock ticks since boot) from /proc/PID/stat: tells a pid
+/// that is still ours from one the kernel reused after we signalled it.
+fn start_time(pid: u64) -> Option<u64> {
+    parse_starttime(&read_capped(&format!("/proc/{pid}/stat"), CAP_STATUS)?)
+}
+
+/// A hung app ignores SIGTERM (its handler runs on the stuck main loop):
+/// give it a grace period to exit cleanly, then SIGKILL whatever is left,
+/// through the same pidfds.
+fn kill_survivors(pinned: &[sys::Pidfd]) {
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(2500);
+    let deadline = std::time::Instant::now() + GRACE;
+    while pinned.iter().any(|fd| !fd.exited(0)) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    for fd in pinned.iter().filter(|fd| !fd.exited(0)) {
+        fd.signal(sys::SIGKILL);
     }
 }
 
 // ---------- single-thread (subprocess) control ----------
-// Browser tabs live in renderer pids INSIDE the app's systemd scope, so the
-// scope freezer cannot touch one thread alone: freeze the scope and the whole
+// Browser tabs live in renderer pids INSIDE the app's scope, so the scope
+// freezer cannot touch one process alone: freeze the scope and the whole
 // browser pauses. Single-pid control therefore always uses signals + marker
 // files, exactly like the no-scope fallback, and never touches memory.high.
 
 /// Pause ONE subprocess (e.g. a hung browser tab/renderer).
-fn cmd_freeze_pid(pid: u64) {
-    if pid_stopped(pid) {
+fn cmd_freeze_pid(t: Target) {
+    let st = verify(t);
+    if pid_stopped(t.pid) {
         return;
     }
-    sig(pid, "-STOP");
-    marker_add(pid);
+    if signal(t.pid, Some(st), sys::SIGSTOP) {
+        marker_add(t.pid);
+    }
 }
 
 /// Resume ONE subprocess paused with freeze-pid (or by anyone: CONT is a
 /// no-op for a running process).
-fn cmd_thaw_pid(pid: u64) {
-    sig(pid, "-CONT");
-    marker_remove(pid);
+fn cmd_thaw_pid(t: Target) {
+    let st = verify(t);
+    signal(t.pid, Some(st), sys::SIGCONT);
+    marker_remove(t.pid);
 }
 
 /// Close ONE subprocess: CONT first (a stopped process cannot die cleanly),
-/// then SIGTERM. Killing a renderer shows the browser's per-tab crash page,
-/// which is exactly what the user wants for a hung tab.
-fn cmd_kill_pid(pid: u64) {
-    sig(pid, "-CONT");
-    marker_remove(pid);
-    sig(pid, "-TERM");
+/// then SIGTERM (SIGKILL after a grace period). Killing a renderer shows the
+/// browser's per-tab crash page, which is what the user wants for a hung tab.
+fn cmd_kill_pid(t: Target) {
+    let Ok(fd) = sys::Pidfd::open(t.pid) else {
+        verify(t); // exits 3
+        return;
+    };
+    let st = verify(t);
+    if start_time(t.pid) != Some(st) {
+        return;
+    }
+    fd.signal(sys::SIGCONT);
+    marker_remove(t.pid);
+    fd.signal(sys::SIGTERM);
+    kill_survivors(&[fd]);
 }
 
 // ---------- live history (written by `watch`, read by state/history) ----------
-fn history_path() -> String {
-    let rt = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    format!("{rt}/omarchy-task-manager/history.json")
+const HISTORY: &str = "history.json";
+const PREFS: &str = "prefs.json";
+const EMPTY_HISTORY: &str = "{\"ts\":[],\"cpu\":[],\"mem\":[],\"gpu\":null,\"cores\":[],\"apps\":{}}";
+
+/// Writable UI prefs: (key, kind). Kinds: bool, mode, sort, px, ram, cpu.
+const PREF_KEYS: &[(&str, &str)] = &[
+    ("barStats", "bool"),
+    ("showGraphs", "bool"),
+    ("graphDetail", "bool"),
+    ("sparklines", "bool"),
+    ("veils", "bool"),
+    ("watchdog", "bool"),
+    ("barMode", "mode"),
+    ("cardW", "px"),
+    ("cardH", "px"),
+    ("sortBy", "sort"),
+    ("watchMaxRam", "ram"),
+    ("watchMaxCpu", "cpu"),
+    ("engine", "engine"),
+];
+
+/// Validate one pref value; Some(json value) when acceptable.
+fn pref_value(kind: &str, value: &str) -> Option<Value> {
+    match kind {
+        "bool" => match value {
+            "1" | "true" => Some(json!(true)),
+            "0" | "false" => Some(json!(false)),
+            _ => None,
+        },
+        // Tri-state pill display: off / numbers / numbers+graph.
+        "mode" => ["off", "numbers", "graph"].contains(&value).then(|| json!(value)),
+        "sort" => ["ram", "cpu", "name"].contains(&value).then(|| json!(value)),
+        // Which engine the card runs: auto (Rust when built) or light (Python).
+        "engine" => ["auto", "light"].contains(&value).then(|| json!(value)),
+        // Persisted card geometry (px, sanity-clamped), kept as a string.
+        "px" => value
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (300..=3000).contains(n))
+            .map(|n| json!(n.to_string())),
+        // Watchdog thresholds (%): RAM used 50..=99; CPU 0 (off) or 50..=99.
+        "ram" => value.parse::<u32>().ok().filter(|n| (50..=99).contains(n)).map(|n| json!(n)),
+        "cpu" => value
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n == 0 || (50..=99).contains(n))
+            .map(|n| json!(n)),
+        _ => None,
+    }
 }
 
-fn prefs_path() -> String {
-    let home = env::var("HOME").unwrap_or_default();
-    format!("{home}/.local/state/omarchy-task-manager/prefs.json")
-}
-
-fn read_prefs() -> String {
-    fs::read_to_string(prefs_path()).unwrap_or_else(|_| "{}".into())
+/// Prefs as stored, keeping only known keys with values of the right shape
+/// (the file is re-validated on every read, never echoed raw).
+fn read_prefs() -> Value {
+    let raw = state_dir().and_then(|d| d.read_string(PREFS)).unwrap_or_default();
+    let v = json::from_str(&raw).unwrap_or(Value::Null);
+    let mut out = json!({});
+    for (k, kind) in PREF_KEYS {
+        let Some(x) = v.get(k) else { continue };
+        let ok = match (*kind, x) {
+            ("bool", Value::Bool(_)) => true,
+            ("mode" | "sort" | "px" | "engine", Value::String(s)) => pref_value(kind, s).is_some(),
+            ("ram" | "cpu", n) => n.as_u64().is_some_and(|n| pref_value(kind, &n.to_string()).is_some()),
+            _ => false,
+        };
+        if ok {
+            out[*k] = x.clone();
+        }
+    }
+    out
 }
 
 /// utime+stime jiffies for a pid (robust against spaces/parens in comm).
 fn proc_jiffies(pid: u64) -> u64 {
-    let Ok(text) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+    let Some(text) = read_capped(&format!("/proc/{pid}/stat"), CAP_STATUS) else {
         return 0;
     };
     let Some(rp) = text.rfind(')') else {
         return 0;
     };
-    let f: Vec<&str> = text[rp + 2..].split_whitespace().collect();
+    let f: Vec<&str> = text.get(rp + 1..).unwrap_or("").split_whitespace().collect();
     let u: u64 = f.get(11).and_then(|s| s.parse().ok()).unwrap_or(0);
     let s: u64 = f.get(12).and_then(|s| s.parse().ok()).unwrap_or(0);
     u + s
@@ -1185,7 +1448,7 @@ fn proc_jiffies(pid: u64) -> u64 {
 
 /// (busy, total, per-core (busy,total)) from /proc/stat.
 fn cpu_times() -> (u64, u64, Vec<(u64, u64)>) {
-    let Ok(text) = fs::read_to_string("/proc/stat") else {
+    let Some(text) = read_trim("/proc/stat") else {
         return (0, 0, Vec::new());
     };
     let mut total = (0u64, 0u64);
@@ -1326,21 +1589,16 @@ impl Hist {
     }
 
     fn write(&self) {
-        let p = history_path();
-        if let Some(parent) = Path::new(&p).parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let tmp = format!("{p}.tmp");
-        if fs::write(&tmp, self.to_json()).is_ok() {
-            let _ = fs::rename(&tmp, &p);
+        if let Some(d) = runtime() {
+            let _ = d.write_atomic(HISTORY, self.to_json().as_bytes());
         }
     }
 }
 
 /// Latest instantaneous values from the history tail (if the daemon is alive).
 fn now_from_history() -> Option<(f32, f32)> {
-    let text = fs::read_to_string(history_path()).ok()?;
-    let v: Value = serde_json::from_str(&text).ok()?;
+    let text = runtime()?.read_string(HISTORY)?;
+    let v = json::from_str(&text).ok()?;
     let cpu = v.get("cpu")?.as_array()?.last()?.as_f64()? as f32;
     let mem = v.get("mem")?.as_array()?.last()?.as_f64()? as f32;
     let ts = v.get("ts")?.as_array()?.last()?.as_u64()?;
@@ -1356,7 +1614,9 @@ fn now_from_history() -> Option<(f32, f32)> {
 
 /// Per-process rows for the tree view: the WHOLE family (same comm), so
 /// background scope-mates appear inside the app's tree.
-fn cmd_procs(pid: u64) {
+fn cmd_procs(t: Target) {
+    verify(t);
+    let pid = t.pid;
     let members = comm_family(pid);
     // Hierarchy beats raw size: the browser main process first, then
     // renderers by RSS (the actual tab cost), then service roles, with
@@ -1365,10 +1625,11 @@ fn cmd_procs(pid: u64) {
     let mut rows: Vec<(u64, String, u64, String, String)> = members
         .iter()
         .map(|p| {
-            let state = fs::read_to_string(format!("/proc/{p}/stat"))
-                .ok()
-                .and_then(|t| t.rfind(')').map(|rp| t[rp + 2..].to_string()))
-                .and_then(|rest| rest.chars().next().map(|c| c.to_string()))
+            let state = read_capped(&format!("/proc/{p}/stat"), CAP_STATUS)
+                .and_then(|t| t.rfind(')').and_then(|rp| t.get(rp + 1..).map(str::to_string)))
+                .and_then(|rest| rest.split_whitespace().next().and_then(|s| s.chars().next()))
+                .filter(|c| c.is_ascii_alphabetic())
+                .map(|c| c.to_string())
                 .unwrap_or_else(|| "?".into());
             (
                 *p,
@@ -1402,7 +1663,8 @@ fn cmd_procs(pid: u64) {
         .iter()
         .map(|(p, c, r, s, role)| {
             format!(
-                "{{\"pid\":{p},\"comm\":\"{}\",\"role\":\"{}\",\"rss_mb\":{r},\"state\":\"{s}\"}}",
+                "{{\"pid\":{p},\"start\":{},\"comm\":\"{}\",\"role\":\"{}\",\"rss_mb\":{r},\"state\":\"{s}\"}}",
+                start_time(*p).unwrap_or(0),
                 json_escape(c),
                 json_escape(role)
             )
@@ -1413,81 +1675,33 @@ fn cmd_procs(pid: u64) {
 
 /// Set a UI preference (persisted, read back via state.prefs).
 fn cmd_pref(key: &str, value: &str) {
-    let allowed = [
-        "barStats",
-        "showGraphs",
-        "graphDetail",
-        "sparklines",
-        "barMode",
-        "cardW",
-        "cardH",
-        "sortBy",
-        "watchMaxRam",
-        "watchMaxCpu",
-    ];
-    if !allowed.contains(&key) {
+    let Some((_, kind)) = PREF_KEYS.iter().find(|(k, _)| *k == key) else {
         return;
-    }
-    let p = prefs_path();
-    if let Some(parent) = Path::new(&p).parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let cur = read_prefs();
-    let mut v: Value = serde_json::from_str(&cur).unwrap_or_else(|_| serde_json::json!({}));
-    if key == "barMode" {
-        // Tri-state pill display: off / numbers / numbers+graph.
-        if !["off", "numbers", "graph"].contains(&value) {
-            return;
-        }
-        v[key] = serde_json::json!(value);
-    } else if key == "sortBy" {
-        if !["ram", "cpu", "name"].contains(&value) {
-            return;
-        }
-        v[key] = serde_json::json!(value);
-    } else if key == "cardW" || key == "cardH" {
-        // Persisted card geometry (px, sanity-clamped).
-        let Ok(n) = value.parse::<u32>() else { return };
-        if !(300..=3000).contains(&n) {
-            return;
-        }
-        v[key] = serde_json::json!(value);
-    } else if key == "watchMaxRam" || key == "watchMaxCpu" {
-        // Watchdog thresholds (%): RAM used 50..=99; CPU 0 (off) or 50..=99.
-        let Ok(n) = value.parse::<u32>() else { return };
-        let ok = if key == "watchMaxRam" {
-            (50..=99).contains(&n)
-        } else {
-            n == 0 || (50..=99).contains(&n)
-        };
-        if !ok {
-            return;
-        }
-        v[key] = serde_json::json!(n);
-    } else {
-        v[key] = serde_json::json!(value == "1" || value == "true");
-    }
-    let tmp = format!("{p}.tmp");
-    if let Ok(text) = serde_json::to_string(&v) {
-        if fs::write(&tmp, text).is_ok() {
-            let _ = fs::rename(&tmp, &p);
-        }
+    };
+    let Some(val) = pref_value(kind, value) else {
+        return;
+    };
+    let mut v = read_prefs();
+    v[key] = val;
+    if let Some(d) = state_dir() {
+        let _ = d.write_atomic(PREFS, v.to_string().as_bytes());
     }
 }
 
+/// The history the watchdog wrote, re-serialized (never echoed raw).
 fn cmd_history() {
-    match fs::read_to_string(history_path()) {
-        Ok(text) => println!("{text}"),
-        Err(_) => {
-            println!("{{\"ts\":[],\"cpu\":[],\"mem\":[],\"gpu\":null,\"cores\":[],\"apps\":{{}}}}")
-        }
+    let v = runtime()
+        .and_then(|d| d.read_string(HISTORY))
+        .and_then(|t| json::from_str(&t).ok())
+        .filter(Value::is_object);
+    match v {
+        Some(v) => println!("{v}"),
+        None => println!("{EMPTY_HISTORY}"),
     }
 }
 
 fn focused_pid() -> Option<u64> {
-    let text = hyprctl(&["activewindow", "-j"]);
-    let v: Value = serde_json::from_str(&text).ok()?;
-    v.get("pid")?.as_u64()
+    hypr::query("activewindow")?.get("pid")?.as_u64()
 }
 
 /// Biggest freezable candidate: windowed app or background scope, never the
@@ -1543,12 +1757,21 @@ fn freeze_biggest(skip: &std::collections::BTreeSet<String>) -> Option<String> {
     }
 
     let (pid, name, mb) = best?;
-    cmd_freeze(pid);
+    freeze_family(pid);
     // The user must KNOW an app was auto-paused, or it looks like a crash.
     let (title, body) = notify_autopause_text(&name, mb);
-    let _ = Command::new("notify-send")
-        .args(["-a", "Task Manager", "-u", "critical", &title, &body])
-        .spawn();
+    spawn_bounded(
+        "notify-send",
+        vec![
+            "-a".into(),
+            "Task Manager".into(),
+            "-u".into(),
+            "critical".into(),
+            cap_str(&title),
+            body,
+        ],
+        10,
+    );
     Some(format!("{name} ({mb} MB)"))
 }
 
@@ -1576,18 +1799,18 @@ fn notify_autopause_text(name: &str, mb: u64) -> (String, String) {
 fn sample_history(
     hist: &mut Hist,
     prev: &mut (u64, u64, Vec<(u64, u64)>),
-    prev_apps: &mut BTreeMap<String, u64>,
+    prev_apps: &mut BTreeMap<u64, u64>,
 ) {
     let st = cpu_times();
     let dt = st.1.saturating_sub(prev.1).max(1);
     let cpu = st.0.saturating_sub(prev.0) as f32 * 100.0 / dt as f32;
-    let ncores = st.2.len().max(1) as f32;
     let mut core_pcts = Vec::new();
     for (i, (b, t)) in st.2.iter().enumerate() {
         let (pb, pt) = prev.2.get(i).copied().unwrap_or((*b, *t));
         let d = t.saturating_sub(pt).max(1);
         core_pcts.push(b.saturating_sub(pb) as f32 * 100.0 / d as f32);
     }
+    let ncores = st.2.len().max(1) as f32;
     *prev = st;
 
     let (ttotal, tavail, _, _, _, _) = mem_info();
@@ -1602,7 +1825,20 @@ fn sample_history(
     for w in clients(&mons) {
         by_pid.entry(w.pid).or_default().push(w);
     }
-    let mut apps: Vec<(String, f32, f32)> = Vec::new();
+    // One entry per history key (first RSS, union of pids), so each series
+    // gets exactly one sample per tick.
+    fn add(groups: &mut Vec<(String, f32, Vec<u64>)>, key: String, rss_mb: f32, pids: Vec<u64>) {
+        if let Some(g) = groups.iter_mut().find(|g| g.0 == key) {
+            for p in pids {
+                if !g.2.contains(&p) {
+                    g.2.push(p);
+                }
+            }
+        } else {
+            groups.push((key, rss_mb, pids));
+        }
+    }
+    let mut groups: Vec<(String, f32, Vec<u64>)> = Vec::new();
     for pid in by_pid.keys() {
         let c = comm(*pid);
         if EXCLUDE_COMMS.contains(&c.as_str()) {
@@ -1611,56 +1847,129 @@ fn sample_history(
         // Family-wide series: matches the row's RSS (window + background).
         let family = comm_family(*pid);
         let rss: u64 = family.iter().map(|p| rss_kb(*p)).sum();
-        let j: u64 = family.iter().map(|p| proc_jiffies(*p)).sum();
         let key = family_scopes(&family)
             .first()
             .map(|(_, u)| u.clone())
             .unwrap_or_else(|| format!("pid{pid}"));
-        let pj = prev_apps.insert(key.clone(), j).unwrap_or(j);
-        let cpu_pct = j.saturating_sub(pj) as f32 * ncores * 100.0 / dt as f32;
-        apps.push((key, rss as f32 / 1024.0, cpu_pct));
+        add(&mut groups, key, rss as f32 / 1024.0, family);
     }
-    // Background scope groups get series too (CPU% next to their names).
+    // Every background group gets its own series, keyed "bg:<comm>" (its
+    // biggest pid can change between ticks, the name doesn't). Helpers that
+    // share a windowed app's scope (a browser's "Isolated Web Co") also
+    // count toward that app's row, so the row shows the whole app.
     let marks = marker_pids();
     for bg in collect_background(&by_pid, &marks) {
-        if bg.mechanism != "scope" || bg.unit.is_empty() {
-            continue;
-        }
         let family = comm_family(bg.pid);
-        let j: u64 = family.iter().map(|p| proc_jiffies(*p)).sum();
-        let pj = prev_apps.insert(bg.unit.clone(), j).unwrap_or(j);
-        let cpu_pct = j.saturating_sub(pj) as f32 * ncores * 100.0 / dt as f32;
-        apps.push((bg.unit, bg.rss_mb as f32, cpu_pct));
+        if !bg.unit.is_empty() && groups.iter().any(|g| g.0 == bg.unit) {
+            add(&mut groups, bg.unit.clone(), 0.0, family.clone());
+        }
+        add(&mut groups, format!("bg:{}", bg.name), bg.rss_mb as f32, family);
+    }
+    // System daemons: keyed "sys:<comm>", CPU summed over the group's pids
+    // (/proc/<pid>/stat is world-readable, nothing is signalled).
+    for (grp, pids) in system_groups(&by_pid) {
+        add(&mut groups, format!("sys:{}", grp.name), grp.rss_mb as f32, pids);
+    }
+    // CPU per group = sum of per-pid jiffy deltas since the last tick. A pid
+    // first seen this tick adds 0: summing raw totals instead counted a new
+    // child's whole lifetime as one tick (false spikes on Firefox tabs).
+    let mut next_pids: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut apps: Vec<(String, f32, f32)> = Vec::new();
+    for (key, rss_mb, pids) in groups {
+        let d: u64 = pids
+            .iter()
+            .map(|p| {
+                let j = proc_jiffies(*p);
+                next_pids.insert(*p, j);
+                prev_apps.get(p).map_or(0, |pj| j.saturating_sub(*pj))
+            })
+            .sum();
+        // dt spans every core, so d/dt is the share of the whole machine;
+        // times ncores gives % of one core, like top (100% = a full core).
+        apps.push((key, rss_mb, d as f32 * ncores * 100.0 / dt as f32));
     }
     apps.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    // Keep enough series for every listed row to show CPU% (was 8: small
-    // windowed apps fell off and showed no percentage).
-    apps.truncate(16);
-    prev_apps.retain(|k, _| apps.iter().any(|a| &a.0 == k));
+    // Enough series for every listed row (windowed apps, up to 40
+    // background groups and 6 system ones) to show CPU%.
+    apps.truncate(72);
+    *prev_apps = next_pids;
     hist.push(cpu, mem_pct, core_pcts, apps);
     hist.write();
 }
 
-/// One watchdog per user: two governors would fight over the same cgroups
-/// and the same governor.json (a second instance's limits end up owned by
-/// nobody). The lock is a pid file checked for a live task-manager.
-fn watch_lock() -> bool {
-    let path = format!("{}/omarchy-task-manager/watch.pid", runtime_dir());
-    let _ = fs::create_dir_all(format!("{}/omarchy-task-manager", runtime_dir()));
-    if let Some(pid) = read_trim(&path).and_then(|s| s.parse::<u64>().ok()) {
-        let me = std::process::id() as u64;
-        if pid != me && comm(pid).starts_with("task-manager") {
-            return false;
-        }
+/// Undo everything this engine froze or limited: governor limits first
+/// (they skip scopes we froze), then every scope and pid in the marker.
+fn release_everything() {
+    let n = governor::release_all();
+    let m = marker_read();
+    for cg in &m.scopes {
+        set_memory_high(cg, "max");
+        cg_write(cg, "cgroup.freeze", "0");
     }
-    fs::write(&path, std::process::id().to_string()).is_ok()
+    for (p, st) in &m.pids {
+        signal(*p, Some(*st), sys::SIGCONT);
+    }
+    marker_write(&Marker { pids: Vec::new(), scopes: Vec::new() });
+    eprintln!(
+        "task-manager watch: released {n} limit(s), thawed {} scope(s) and {} process(es)",
+        m.scopes.len(),
+        m.pids.len()
+    );
+}
+
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn stopping() -> bool {
+    STOP.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Lifeline: the parent (the shell) holds our stdin open; EOF means it is
+/// gone, so the watchdog must not outlive it with apps left frozen.
+fn start_lifeline() {
+    std::thread::spawn(|| {
+        use std::io::Read;
+        let mut buf = [0u8; 256];
+        let mut stdin = std::io::stdin();
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+/// Sleep in short steps so a lifeline EOF is honoured quickly.
+fn nap(ms: u64) {
+    let mut left = ms;
+    while left > 0 && !stopping() {
+        let step = left.min(100);
+        std::thread::sleep(std::time::Duration::from_millis(step));
+        left -= step;
+    }
 }
 
 /// Memory-pressure watchdog: freeze biggest apps while pressure is critical.
-fn cmd_watch() {
-    if !watch_lock() {
-        eprintln!("task-manager watch: another instance is running; exiting");
-        std::process::exit(0);
+/// One per user (flock on the runtime dir's watch.lock): two governors would
+/// fight over the same cgroups and the same governor.json.
+fn cmd_watch(lifeline: bool) {
+    let Some(rt) = runtime() else {
+        std::process::exit(1);
+    };
+    let _lock = match rt.try_lock("watch.lock") {
+        Ok(Some(fd)) => fd,
+        Ok(None) => {
+            println!("busy");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("task-manager watch: lock: {e}");
+            std::process::exit(1);
+        }
+    };
+    if lifeline {
+        start_lifeline();
     }
     eprintln!(
         "task-manager watch: pid {} crit avail<{:.0}%, or avail<{:.0}% + psi_full>{:.0}, sustained 5s, recover>{:.0}%, max {} per episode",
@@ -1676,7 +1985,7 @@ fn cmd_watch() {
     let mut hist = Hist::new();
     let mut prev_stat = cpu_times();
     let mut prev_cpu = cpu_times();
-    let mut prev_apps: BTreeMap<String, u64> = BTreeMap::new();
+    let mut prev_apps: BTreeMap<u64, u64> = BTreeMap::new();
     // Per-app cooldown: never auto-freeze the same app twice within 10 min —
     // re-freezing the user's browser every pressure blip reads as "Chrome
     // keeps hanging".
@@ -1685,21 +1994,16 @@ fn cmd_watch() {
     let mut gov = governor::Governor::new();
     let mut tick = 0u32;
     loop {
+        if stopping() {
+            release_everything();
+            std::process::exit(0);
+        }
         let (total, avail, psi_some, psi_full, _, _) = mem_info();
         let (pct, mut crit) = pressure(total, avail, psi_some, psi_full);
         // Governor every 2s: squeeze background work early so the freeze
         // below stays a last resort.
         if tick % 4 == 0 {
             gov.tick(pct, psi_some);
-        }
-        // Queued browser Memory Saver change: applied once the browser exits.
-        if tick % 20 == 7 {
-            browser::apply_pending();
-        }
-        // tmpfs hygiene: 30s after start, then every 10 minutes.
-        // Off-thread: the /proc and /tmp walks must not delay freezes.
-        if tick % 1200 == 60 {
-            std::thread::spawn(hygiene::sweep);
         }
         // CPU trigger (pref watchMaxCpu, 0 = off): freeze the biggest app
         // when total CPU stays pegged — freezing stops the burn instantly.
@@ -1746,7 +2050,7 @@ fn cmd_watch() {
                     frozen_this_episode += 1;
                     hits = 0;
                     tick += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(2000));
+                    nap(2000);
                     continue;
                 }
                 None => {
@@ -1764,36 +2068,13 @@ fn cmd_watch() {
         if tick % 4 == 0 {
             sample_history(&mut hist, &mut prev_stat, &mut prev_apps);
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        nap(500);
     }
-}
-
-/// Copy the zswap enable command to the clipboard via wl-copy (stdin form).
-fn cmd_zswap_copy() {
-    use std::io::Write;
-    let mut child = match Command::new("wl-copy")
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => {
-            // No clipboard tool: print the command so the caller can show it.
-            let (_, enabled, zram) = zswap_status();
-            println!("{}", if enabled && zram { ZSWAP_DISABLE_CMD } else { ZSWAP_ENABLE_CMD });
-            return;
-        }
-    };
-    let (_, enabled, zram) = zswap_status();
-    let cmd = if enabled && zram { ZSWAP_DISABLE_CMD } else { ZSWAP_ENABLE_CMD };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(cmd.as_bytes());
-    }
-    let _ = child.wait();
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: task-manager <state|wins PID|freeze PID|thaw PID|focus PID|kill PID|freeze-pid PID|thaw-pid PID|kill-pid PID|procs PID|zswap-copy|chrome-memory-saver [on|off]|clean-tmp|hygiene|governor-release|pref K V|history|watch|follow>"
+        "usage: task-manager <state [--brief]|freeze T|thaw T|focus T|kill T|freeze-pid T|thaw-pid T|kill-pid T|procs T|governor-explain|governor-release|pref K V|popup [0|1]|binds|veil-lock|shell-reset [force|list]|history|watch [--lifeline]|follow>  (T = PID or PID:START)"
     );
     std::process::exit(1)
 }
@@ -1801,22 +2082,11 @@ fn usage() -> ! {
 /// Stream compositor events (Hyprland socket2), one per line, so the QML
 /// veil layer can react INSTANTLY instead of polling: retop on focus,
 /// follow on workspace moves, cleanup on close. Only veil-relevant events
-/// are forwarded.
+/// are forwarded; lines are length-capped.
 fn cmd_follow() {
-    use std::io::{BufRead, BufReader, Write};
-    let his = env::var("HYPRLAND_INSTANCE_SIGNATURE").unwrap_or_default();
-    let path = format!("{}/hypr/{}/.socket2.sock", runtime_dir(), his);
-    let sock = match std::os::unix::net::UnixStream::connect(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("follow: connect {path}: {e}");
-            std::process::exit(1);
-        }
-    };
-    let reader = BufReader::new(sock);
+    use std::io::Write;
     let mut out = std::io::stdout().lock();
-    for line in reader.lines() {
-        let Ok(l) = line else { break };
+    hypr::events(|l| {
         if l.starts_with("activewindowv2>>")
             || l.starts_with("movewindowv2>>")
             || l.starts_with("closewindow>>")
@@ -1824,178 +2094,83 @@ fn cmd_follow() {
             || l.starts_with("workspace>>")
             || l.starts_with("changefloatingmode>>")
         {
-            if writeln!(out, "{l}").is_err() || out.flush().is_err() {
-                break; // consumer gone
-            }
+            // Consumer gone: stop.
+            return writeln!(out, "{l}").is_ok() && out.flush().is_ok();
         }
-    }
+        true
+    });
 }
 
-/// Native Messaging host for the companion "Omarchy Task Manager Tabs"
-/// extension (long-lived port mode, connectNative): reads framed tab reports
-/// from stdin and persists them atomically (user-only, 0600), and forwards
-/// local commands (written by `tabs-cmd`) back to the extension over stdout.
-/// Chrome keeps this process alive for the browser session.
-fn cmd_tabs_host() {
-    use std::io::Read;
-    let Some(home) = env::var_os("HOME") else {
-        std::process::exit(1);
+/// Hold the veil-owner lock while our stdin (the shell) stays open: the
+/// first BarWidget instance to get it renders the veils. The kernel drops
+/// the lock when we exit, so a dead shell never leaves a stale owner.
+fn cmd_veil_lock() {
+    use std::io::{Read, Write};
+    let lock = runtime().map(|d| d.try_lock("veil.lock"));
+    let held = match lock {
+        Some(Ok(Some(fd))) => fd,
+        Some(Ok(None)) => {
+            println!("busy");
+            return;
+        }
+        _ => {
+            println!("error");
+            std::process::exit(1);
+        }
     };
-    let dir = Path::new(&home).join(".cache/omarchy/task-manager");
-    let _ = fs::create_dir_all(&dir);
-    let cmd_path = dir.join("tabs-cmd.json");
-    let cache = dir.join("tabs.json");
-
-    // Writer thread: poll the command file, forward each command to the
-    // extension (framed), and remove it once sent.
-    let cmd_tx;
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    cmd_tx = tx;
-    std::thread::spawn(move || loop {
-        if let Ok(text) = fs::read_to_string(&cmd_path) {
-            if serde_json::from_str::<Value>(&text).is_ok() {
-                let _ = cmd_tx.send(text);
-                let _ = fs::remove_file(&cmd_path);
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(400));
-    });
-
-    let stdout = std::io::stdout();
-    std::thread::spawn(move || {
-        use std::io::Write as _;
-        while let Ok(cmd) = rx.recv() {
-            let mut out = stdout.lock();
-            let _ = out.write_all(&(cmd.len() as u32).to_le_bytes());
-            let _ = out.write_all(cmd.as_bytes());
-            let _ = out.flush();
-        }
-    });
-
-    let stdin = std::io::stdin();
-    let mut input = stdin.lock();
-    loop {
-        let mut len = [0u8; 4];
-        if input.read_exact(&mut len).is_err() {
-            break; // browser closed the port
-        }
-        let n = u32::from_le_bytes(len) as usize;
-        if n == 0 || n > 4 * 1024 * 1024 {
+    let mut so = std::io::stdout();
+    let _ = writeln!(so, "owned");
+    let _ = so.flush();
+    let mut buf = [0u8; 256];
+    let mut stdin = std::io::stdin();
+    while let Ok(n) = stdin.read(&mut buf) {
+        if n == 0 {
             break;
         }
-        let mut buf = vec![0u8; n];
-        if input.read_exact(&mut buf).is_err() {
-            break;
-        }
-        let Ok(v) = serde_json::from_slice::<Value>(&buf) else {
-            continue;
-        };
-        let Some(tabs) = v.get("tabs").and_then(|t| t.as_array()) else {
-            continue;
-        };
-        // ACK every message: port-mode extensions ignore it, but a one-shot
-        // sendNativeMessage caller (extension ≤0.1.x) holds stdin open until
-        // a reply arrives — without this ack the host loops forever per
-        // one-shot message and leaks one process per tab event.
-        {
-            use std::io::Write as _;
-            let ack = b"{\"ok\":true}";
-            let mut out = std::io::stdout().lock();
-            let _ = out.write_all(&(ack.len() as u32).to_le_bytes());
-            let _ = out.write_all(ack);
-            let _ = out.flush();
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let out = serde_json::json!({ "updatedAt": now, "tabs": tabs }).to_string();
-        let tmp = dir.join(format!("tabs.json.{}", std::process::id()));
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            if let Ok(mut f) = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)
-            {
-                use std::io::Write as _;
-                if f.write_all(out.as_bytes()).is_ok() {
-                    let _ = fs::rename(&tmp, &cache);
-                }
-            }
-        }
     }
+    drop(held);
 }
 
-/// Queue a command for the browser extension (e.g. `tabs-cmd discard 123`).
-/// The long-lived tabs host forwards it to the extension within ~0.5s.
-fn cmd_tabs_cmd(action: &str, id: &str) {
-    let tab_id: u64 = id.parse().unwrap_or_else(|_| usage());
-    if action != "discard" && action != "discard-background" {
-        usage();
-    }
-    let Some(home) = env::var_os("HOME") else {
+/// Shared popup-open flag (all BarWidget instances watch it).
+fn cmd_popup(set: Option<&str>) {
+    let Some(d) = runtime() else {
         std::process::exit(1);
     };
-    let dir = Path::new(&home).join(".cache/omarchy/task-manager");
-    let _ = fs::create_dir_all(&dir);
-    let out = serde_json::json!({ "action": action, "tabId": tab_id }).to_string();
-    let tmp = dir.join(format!("tabs-cmd.json.{}", std::process::id()));
-    let dst = dir.join("tabs-cmd.json");
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        if let Ok(mut f) = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-        {
-            use std::io::Write as _;
-            if f.write_all(out.as_bytes()).is_ok() {
-                let _ = fs::rename(&tmp, &dst);
+    match set {
+        Some(v @ ("0" | "1")) => {
+            if d.write_atomic("popup", v.as_bytes()).is_err() {
+                std::process::exit(1);
             }
+        }
+        Some(_) => usage(),
+        None => {
+            let open = d
+                .read_capped("popup", 16)
+                .map(|b| b.first() == Some(&b'1'))
+                .unwrap_or(false);
+            println!("{}", if open { 1 } else { 0 });
         }
     }
 }
 
-/// Browser comms that consume the tabs cache.
-fn is_browser_comm(c: &str) -> bool {
-    let l = c.to_lowercase();
-    l.contains("chrom") || l.contains("brave") || l.contains("edge")
+/// Which of the Task Manager's optional Hyprland binds the user has set up.
+fn cmd_binds() {
+    let v = hypr::request_capped("j/binds", 2 * 1024 * 1024)
+        .and_then(|t| json::from_str(&t).ok());
+    let has = |desc: &str| {
+        v.as_ref()
+            .and_then(Value::as_array)
+            .map(|a| a.iter().any(|b| b["description"].as_str() == Some(desc)))
+            .unwrap_or(false)
+    };
+    println!(
+        "{}",
+        json!({"show": has("Task Manager"), "reset": has("Force reset shell")})
+    );
 }
 
-/// The tabs cache as a JSON array string, only while fresh (the extension
-/// reports on every tab event; stale >2min means the browser/bridge is off).
-fn tabs_cache_json() -> String {
-    let Some(home) = env::var_os("HOME") else {
-        return "[]".into();
-    };
-    let path = Path::new(&home).join(".cache/omarchy/task-manager/tabs.json");
-    let Ok(meta) = fs::metadata(&path) else {
-        return "[]".into();
-    };
-    let fresh = meta
-        .modified()
-        .ok()
-        .and_then(|m| m.elapsed().ok())
-        .map(|e| e.as_secs() < 120)
-        .unwrap_or(false);
-    if !fresh {
-        return "[]".into();
-    }
-    let Ok(text) = fs::read_to_string(&path) else {
-        return "[]".into();
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else {
-        return "[]".into();
-    };
-    v.get("tabs")
-        .and_then(|t| t.as_array())
-        .map(|a| Value::Array(a.clone()).to_string())
-        .unwrap_or_else(|| "[]".into())
+fn target_arg(a: &str) -> Target {
+    parse_target(a).unwrap_or_else(|| usage())
 }
 
 fn main() {
@@ -2003,44 +2178,86 @@ fn main() {
     if args.len() < 2 {
         usage();
     }
+    let one = || -> Target {
+        if args.len() != 3 {
+            usage();
+        }
+        target_arg(&args[2])
+    };
     match args[1].as_str() {
-        "state" => cmd_state(),
-        "freeze" if args.len() == 3 => cmd_freeze(args[2].parse().unwrap_or_else(|_| usage())),
-        "thaw" if args.len() == 3 => cmd_thaw(args[2].parse().unwrap_or_else(|_| usage())),
-        "focus" if args.len() == 3 => cmd_focus(args[2].parse().unwrap_or_else(|_| usage())),
-        "kill" if args.len() == 3 => cmd_kill(args[2].parse().unwrap_or_else(|_| usage())),
-        "freeze-pid" if args.len() == 3 => {
-            cmd_freeze_pid(args[2].parse().unwrap_or_else(|_| usage()))
-        }
-        "thaw-pid" if args.len() == 3 => cmd_thaw_pid(args[2].parse().unwrap_or_else(|_| usage())),
-        "kill-pid" if args.len() == 3 => cmd_kill_pid(args[2].parse().unwrap_or_else(|_| usage())),
-        "zswap-copy" => cmd_zswap_copy(),
-        // `clean-tmp list` = dry run; the UI passes a dummy pid arg.
-        "clean-tmp" => hygiene::cmd_clean_tmp(args.get(2).map(|a| a == "list").unwrap_or(false)),
-        "hygiene" => {
-            hygiene::sweep();
-            println!("{}", hygiene::report());
-        }
+        "state" if args.len() == 2 => cmd_state(false),
+        "state" if args.len() == 3 && args[2] == "--brief" => cmd_state(true),
+        "freeze" => cmd_freeze(one()),
+        "thaw" => cmd_thaw(one()),
+        "focus" => cmd_focus(one()),
+        "kill" => cmd_kill(one()),
+        "freeze-pid" => cmd_freeze_pid(one()),
+        "thaw-pid" => cmd_thaw_pid(one()),
+        "kill-pid" => cmd_kill_pid(one()),
+        "procs" => cmd_procs(one()),
         "governor-explain" => governor::cmd_explain(),
-        "chrome-memory-saver" => browser::cmd_memory_saver(args.get(2).map(|s| s.as_str())),
         "governor-release" => {
             let n = governor::release_all();
             println!("released {n}");
         }
-        "watch" => cmd_watch(),
+        "watch" => match args.get(2).map(String::as_str) {
+            None => cmd_watch(false),
+            Some("--lifeline") => cmd_watch(true),
+            Some(_) => usage(),
+        },
         "follow" => cmd_follow(),
-        "tabs-host" => cmd_tabs_host(),
-        "tabs-cmd" if args.len() == 4 => cmd_tabs_cmd(&args[2], &args[3]),
+        "veil-lock" => cmd_veil_lock(),
+        "popup" if args.len() <= 3 => cmd_popup(args.get(2).map(String::as_str)),
+        "binds" => cmd_binds(),
         "history" => cmd_history(),
-        "procs" if args.len() == 3 => cmd_procs(args[2].parse().unwrap_or_else(|_| usage())),
         "pref" if args.len() == 4 => cmd_pref(&args[2], &args[3]),
+        "shell-reset" => match args.get(2).map(String::as_str) {
+            Some("list") => shell::cmd_shell_reset_list(),
+            Some("force") => shell::cmd_shell_reset(true),
+            None => shell::cmd_shell_reset(false),
+            Some(_) => usage(),
+        },
         _ => usage(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::freeze_critical;
+    use super::{freeze_critical, parse_starttime, parse_target, pref_value, Target};
+
+    #[test]
+    fn targets() {
+        assert_eq!(parse_target("1234"), Some(Target { pid: 1234, start: None }));
+        assert_eq!(parse_target("1234:987654"), Some(Target { pid: 1234, start: Some(987654) }));
+        assert_eq!(parse_target("1234:"), None);
+        assert_eq!(parse_target(":5"), None);
+        assert_eq!(parse_target("-5"), None);
+        assert_eq!(parse_target("1"), None);
+        assert_eq!(parse_target("12x"), None);
+        assert_eq!(parse_target("99999999999"), None);
+        assert_eq!(parse_target("12:3:4"), None);
+    }
+
+    #[test]
+    fn starttime() {
+        // comm with spaces and parens; starttime is field 22.
+        let stat = "4242 (Web (Content) x) S 1 4242 4242 0 -1 4194560 100 0 0 0 5 6 0 0 20 0 1 0 778899 1000 50";
+        assert_eq!(parse_starttime(stat), Some(778899));
+        let zombie = "4242 (x) Z 1 4242 4242 0 -1 4194560 100 0 0 0 5 6 0 0 20 0 1 0 778899 1000 50";
+        assert_eq!(parse_starttime(zombie), None);
+        assert_eq!(parse_starttime("garbage"), None);
+    }
+
+    #[test]
+    fn prefs_validation() {
+        assert_eq!(pref_value("bool", "1").and_then(|v| v.as_bool()), Some(true));
+        assert!(pref_value("bool", "yes").is_none());
+        assert!(pref_value("mode", "graph").is_some());
+        assert!(pref_value("mode", "x").is_none());
+        assert!(pref_value("px", "200").is_none());
+        assert!(pref_value("ram", "100").is_none());
+        assert!(pref_value("cpu", "0").is_some());
+    }
 
     #[test]
     fn freeze_only_at_real_scarcity() {

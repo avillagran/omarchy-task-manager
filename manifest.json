@@ -2,11 +2,13 @@
   "schemaVersion": 1,
   "id": "io.github.avillagran.omarchy-task-manager",
   "name": "Task Manager",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Andrés Villagrán <andres@villagranquiroz.cl>",
   "license": "MIT",
-  "description": "Freeze/resume memory-hogging apps under memory pressure (POC).",
-  "kinds": ["bar-widget"],
+  "description": "Pause and resume memory-hogging apps, kill stuck windows and reset a frozen shell. Runs on the stock Python; an optional Rust engine does the same in less RAM.",
+  "kinds": [
+    "bar-widget"
+  ],
   "entryPoints": {
     "barWidget": "BarWidget.qml"
   },

@@ -2,10 +2,9 @@
 name = "task-manager"
 version = "0.1.0"
 edition = "2021"
-description = "Omarchy task-manager helper: freeze/resume memory-hogging apps (POC)"
+description = "Omarchy Task Manager engine: freeze/resume memory-hogging apps"
 
 [dependencies]
-serde_json = "1"
 
 [profile.release]
 opt-level = 2

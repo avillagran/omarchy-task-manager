@@ -20,13 +20,14 @@
 //!
 //! Every limit we set is recorded in governor.json with the value it
 //! replaced, and restored when pressure clears, on daemon start, and by
-//! `task-manager governor-release` (install.sh --disable/--uninstall).
+//! `task-manager governor-release`, and when the shell that runs the
+//! watchdog goes away (watch --lifeline).
 
+use crate::json::{Map, Value};
 use crate::{
-    clients, comm, current_uid, focused_pid, marker_units, monitors, pref_num, read_trim,
-    runtime_dir, CGROOT,
+    cg_write, clients, comm, focused_pid, marker_units, monitors, pref_num, read_trim, runtime,
+    user_root, CGROOT,
 };
-use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::time::{Duration, Instant};
@@ -57,8 +58,8 @@ const PEAK_WINDOW: Duration = Duration::from_secs(120);
 /// window says nothing about being that app (a build's `bash`/`python3`
 /// next to some windowed script), so the comm-family rule skips them.
 const GENERIC_COMMS: &[&str] = &[
-    "bash", "sh", "dash", "zsh", "fish", "env", "nice", "timeout", "sudo", "make", "python",
-    "python3", "node", "bun", "deno", "perl", "ruby", "java", "uwsm", "systemd-run",
+    "bash", "sh", "dash", "zsh", "fish", "env", "nice", "timeout", "make", "python", "python3",
+    "node", "bun", "deno", "perl", "ruby", "java", "uwsm",
 ];
 
 /// Processes that make a leaf untouchable wherever it lives.
@@ -74,8 +75,7 @@ const PROTECT_COMMS: &[&str] = &[
     "dbus-broker",
     "dbus-daemon",
     "hermes",
-    "task-manager-aa",
-    "task-manager-x8",
+    "task-manager",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -125,7 +125,7 @@ pub enum Class {
     Foreground,
     /// Holds windows, not focused.
     Interactive,
-    /// Windowless scope (agents, builds, `systemd-run --scope`).
+    /// Windowless scope (agents, builds, transient scopes).
     Batch,
     /// Windowless service unit.
     Service,
@@ -222,16 +222,12 @@ pub fn reclaim_chunk(cur: u64, self_psi: f64, budget_left: u64) -> u64 {
 
 // ---------- cgroup I/O ----------
 
-fn user_root() -> String {
-    format!(
-        "/user.slice/user-{uid}.slice/user@{uid}.service",
-        uid = current_uid()
-    )
-}
-
 /// Leaf cgroups (paths relative to CGROOT) under the delegated user subtree.
 fn leaves() -> Vec<String> {
     fn walk(rel: &str, out: &mut Vec<String>, depth: u32) {
+        if out.len() >= 4096 {
+            return;
+        }
         let Ok(rd) = fs::read_dir(format!("{CGROOT}{rel}")) else {
             return;
         };
@@ -286,7 +282,7 @@ fn frozen(rel: &str) -> bool {
 }
 
 fn write_high(rel: &str, value: &str) -> bool {
-    fs::write(format!("{CGROOT}{rel}/memory.high"), value).is_ok()
+    cg_write(rel, "memory.high", value)
 }
 
 fn unit_of(rel: &str) -> String {
@@ -309,15 +305,19 @@ fn label(rel: &str, pids: &[u64]) -> String {
 
 // ---------- persisted state ----------
 
-fn state_path() -> String {
-    format!("{}/omarchy-task-manager/governor.json", runtime_dir())
+const STATE: &str = "governor.json";
+
+fn read_state() -> Value {
+    runtime()
+        .and_then(|d| d.read_string(STATE))
+        .and_then(|t| crate::json::from_str(&t).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}))
 }
 
-fn write_atomic(path: &str, body: &str) {
-    let _ = fs::create_dir_all(format!("{}/omarchy-task-manager", runtime_dir()));
-    let tmp = format!("{path}.tmp");
-    if fs::write(&tmp, body).is_ok() {
-        let _ = fs::rename(&tmp, path);
+fn write_state(v: &Value) {
+    if let Some(d) = runtime() {
+        let _ = d.write_atomic(STATE, v.to_string().as_bytes());
     }
 }
 
@@ -325,12 +325,19 @@ fn write_atomic(path: &str, body: &str) {
 type Owned = BTreeMap<String, (String, u64)>;
 
 fn load_saved() -> Owned {
-    let raw = fs::read_to_string(state_path()).unwrap_or_default();
-    let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    let v = read_state();
     let mut out = BTreeMap::new();
     if let Some(m) = v.get("saved").and_then(|s| s.as_object()) {
-        for (k, val) in m {
-            let orig = val.get("orig").and_then(|o| o.as_str()).unwrap_or("max");
+        for (k, val) in m.iter().take(4096) {
+            if !crate::cg_path_ok(k) {
+                continue;
+            }
+            // Restored values are only "max" or a byte count.
+            let orig = val
+                .get("orig")
+                .and_then(|o| o.as_str())
+                .filter(|o| *o == "max" || (!o.is_empty() && o.len() <= 20 && o.bytes().all(|c| c.is_ascii_digit())))
+                .unwrap_or("max");
             let wrote = val.get("wrote").and_then(|w| w.as_u64()).unwrap_or(0);
             out.insert(k.clone(), (orig.to_string(), wrote));
         }
@@ -339,9 +346,9 @@ fn load_saved() -> Owned {
 }
 
 fn saved_json(saved: &Owned) -> Value {
-    let m: serde_json::Map<String, Value> = saved
+    let m: Map = saved
         .iter()
-        .map(|(k, (o, w))| (k.clone(), serde_json::json!({"orig": o, "wrote": w})))
+        .map(|(k, (o, w))| (k.clone(), json!({"orig": o, "wrote": w})))
         .collect();
     Value::Object(m)
 }
@@ -363,10 +370,13 @@ pub fn release_all() -> usize {
             n += 1;
         }
     }
-    write_atomic(
-        &state_path(),
-        "{\"level\":\"calm\",\"enabled\":true,\"saved\":{},\"limited\":[],\"reclaimed_mb\":0}",
-    );
+    write_state(&json!({
+        "level": "calm",
+        "enabled": true,
+        "saved": json!({}),
+        "limited": Vec::<Value>::new(),
+        "reclaimed_mb": 0
+    }));
     n
 }
 
@@ -593,7 +603,7 @@ impl Governor {
             }
             let before = read_u64(&rel, "memory.current");
             // EAGAIN (could not reclaim it all) is normal; count what moved.
-            let _ = fs::write(format!("{CGROOT}{rel}/memory.reclaim"), chunk.to_string());
+            let _ = cg_write(&rel, "memory.reclaim", &chunk.to_string());
             let freed = before.saturating_sub(read_u64(&rel, "memory.current"));
             self.reclaimed_total += freed;
             *self.idle_reclaimed.entry(rel.clone()).or_insert(0) += chunk;
@@ -607,13 +617,9 @@ impl Governor {
 
     /// Ownership only (status untouched): called right before each write.
     fn persist(&self) {
-        let raw = fs::read_to_string(state_path()).unwrap_or_default();
-        let mut v: Value = serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
-        if !v.is_object() {
-            v = serde_json::json!({});
-        }
+        let mut v = read_state();
         v["saved"] = saved_json(&self.saved);
-        write_atomic(&state_path(), &v.to_string());
+        write_state(&v);
     }
 
     fn write_status(&self, limited: &[(String, String, u64, u64)], enabled: bool) {
@@ -621,17 +627,17 @@ impl Governor {
         let lim: Vec<Value> = limited
             .iter()
             .map(|(u, n, c, h)| {
-                serde_json::json!({"unit": u, "name": n, "cur_mb": c / MIB, "high_mb": h / MIB})
+                json!({"unit": crate::cap_str(u), "name": crate::cap_str(n), "cur_mb": c / MIB, "high_mb": h / MIB})
             })
             .collect();
-        let v = serde_json::json!({
+        let v = json!({
             "level": self.level.as_str(),
             "enabled": enabled,
             "saved": saved,
             "limited": lim,
             "reclaimed_mb": self.reclaimed_total / MIB,
         });
-        write_atomic(&state_path(), &v.to_string());
+        write_state(&v);
     }
 }
 
@@ -680,12 +686,35 @@ pub fn cmd_explain() {
 
 /// Governor status JSON for `state` (written by the watch daemon).
 pub fn status_json() -> String {
-    let raw = fs::read_to_string(state_path()).unwrap_or_default();
-    let mut v: Value = serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
-    if let Some(o) = v.as_object_mut() {
-        o.remove("saved");
-    }
-    v.to_string()
+    let v = read_state();
+    // Only the fields the UI renders, re-validated.
+    let lim: Vec<Value> = v["limited"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .take(64)
+                .map(|e| {
+                    json!({
+                        "unit": crate::cap_str(e["unit"].as_str().unwrap_or("")),
+                        "name": crate::cap_str(e["name"].as_str().unwrap_or("")),
+                        "cur_mb": e["cur_mb"].as_u64().unwrap_or(0),
+                        "high_mb": e["high_mb"].as_u64().unwrap_or(0)
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let level = v["level"]
+        .as_str()
+        .filter(|l| matches!(*l, "calm" | "elevated" | "critical"))
+        .unwrap_or("calm");
+    json!({
+        "level": level,
+        "enabled": v["enabled"].as_bool().unwrap_or(true),
+        "limited": lim,
+        "reclaimed_mb": v["reclaimed_mb"].as_u64().unwrap_or(0)
+    })
+    .to_string()
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ import Quickshell.Io
 import Quickshell.Wayland
 import qs.Ui
 import qs.Commons
+import "Shared.js" as Shared
 
 BarWidget {
   id: root
@@ -80,22 +81,15 @@ BarWidget {
   property real dismissedAt: 0
   property bool cardPosSet: false
   property string cardPosScreen: ""
-  // Popup visibility is SHARED across instances through a runtime file.
-  // The shell preloads a ghost BarWidget instance and its IpcHandler/open()
-  // calls can land on the ghost (whose popup would be invisible); the file
-  // is the single source of truth and only the veil-owner renders the card.
+  // Popup visibility is SHARED across instances in memory (Shared.js). The
+  // shell preloads a ghost BarWidget instance and its IpcHandler/open()
+  // calls can land on the ghost (whose popup would be invisible); only the
+  // owner instance renders the card.
   property bool popupOpen: false
-  readonly property string popupStatePath: Quickshell.env("XDG_RUNTIME_DIR") + "/tm-popup-open"
   function writePopupState(opened) {
-    Quickshell.execDetached(["sh", "-c", "echo " + (opened ? "1" : "0") + " > \"" + root.popupStatePath + "\""])
-  }
-  FileView {
-    id: popupStateFile
-    path: root.popupStatePath
-    watchChanges: true
-    onFileChanged: this.reload()
-    onLoaded: root.popupOpen = (this.text() || "").trim() === "1"
-    onLoadFailed: root.popupOpen = false
+    Shared.setPopup(opened)
+    // The light engine's watch samples per-app CPU only while this is 1.
+    Quickshell.execDetached([root.binPath, "popup", opened ? "1" : "0"])
   }
   property bool pinned: false
   property var prefs: ({})
@@ -104,21 +98,104 @@ BarWidget {
   property real memNow: 0.0
   property var expandedProcs: ({})
   property var suggestions: []
-  // Destructive suggestion actions (confirm: true) need a second click
-  // within 5s; this holds the armed command.
-  property string armedCmd: ""
-  Timer {
-    id: armTimer
-    interval: 5000
-    onTriggered: root.armedCmd = ""
-  }
   property var procsRaw: ({})
   property var procsData: ({})
   property var procsQueue: []
   property int pendingProcsPid: 0
-  property string binPath: (typeof manifest !== 'undefined' && manifest.__sourceDir)
-                           ? manifest.__sourceDir.replace(/\/$/, '') + '/bin/task-manager-launch.sh'
-                           : Qt.resolvedUrl("bin/task-manager-launch.sh").toString().replace("file://", "")
+  readonly property string binDir: (typeof manifest !== 'undefined' && manifest.__sourceDir)
+                                   ? manifest.__sourceDir.replace(/\/$/, '') + '/bin'
+                                   : Qt.resolvedUrl("bin").toString().replace("file://", "")
+  readonly property string rustPath: root.binDir + "/task-manager-launch.sh"
+  readonly property string lightPath: root.binDir + "/task-manager-light.sh"
+  readonly property string buildPath: root.binDir + "/task-manager-build.sh"
+
+  // --- engines --------------------------------------------------------------
+  // Light: bin/task-manager.py on the stock Python, nothing to build; it runs
+  // every command from the first second. Full: the Rust engine built locally
+  // from bin/task-manager-rs (offline, locked; a no-op when the binary already
+  // matches the source), which adds the memory governor and keeps per-app
+  // history while the card is closed. Both speak the same commands and JSON.
+  // engineState: "checking" → "ready" (Rust built) | "nocargo" | "failed" |
+  // "skipped" (the user keeps the light engine).
+  property string engineState: "checking"
+  property bool buildAsked: false
+  readonly property bool lightChosen: root.pref("engine", "auto") === "light"
+  readonly property bool engineFull: root.engineState === "ready" && !root.lightChosen
+  readonly property bool engineReady: true
+  // Long-running helpers (watch, follow) wait until the engine is settled so
+  // they start once, on the engine that stays.
+  readonly property bool engineSettled: root.engineState !== "checking"
+  readonly property string binPath: root.engineFull ? root.rustPath : root.lightPath
+  property string engineError: ""
+  Process {
+    id: engineBuild
+    command: root.capped(16384, 900, [root.buildPath])
+    running: false
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.engineError = (text || "").slice(0, 16384).trim().slice(-600)
+    }
+    onExited: function(code) {
+      root.engineState = code === 0 ? "ready" : (code === 127 ? "nocargo" : "failed")
+      root.refresh()
+    }
+  }
+  function buildEngine() {
+    if (engineBuild.running) return
+    root.engineState = "checking"
+    root.engineError = ""
+    engineBuild.running = true
+  }
+  // Called once the first state (and with it the saved prefs) is known: a
+  // user who keeps the light engine never pays for a cargo build.
+  function settleEngine() {
+    if (root.buildAsked) return
+    root.buildAsked = true
+    if (root.lightChosen) root.engineState = "skipped"
+    else root.buildEngine()
+  }
+  function chooseEngine(light) {
+    root.setPref("engine", light ? "light" : "auto")
+    if (!light && root.engineState !== "ready") root.buildEngine()
+  }
+  // Switching engines restarts the long-running helpers on the new one.
+  onBinPathChanged: {
+    if (watchProc.running) root.watchDead = true
+    if (veilEventsProc.running) root.veilEventsDead = true
+  }
+
+  // --- bounded subprocess output -------------------------------------------
+  // Every collected command runs under a timeout and a byte ceiling: argv
+  // is passed as positional parameters (never spliced into the shell
+  // program), stderr is discarded, the exit status survives the pipe, and
+  // output that reaches the ceiling is rejected by clip().
+  function capped(bytes, seconds, argv) {
+    return ["sh", "-c", "set -o pipefail; timeout -k 1 " + seconds + " \"$@\" 2>/dev/null | head -c " + (bytes + 1),
+            "sh"].concat(argv)
+  }
+  function clip(text, bytes) {
+    var t = text || ""
+    return t.length > bytes ? "" : t
+  }
+  readonly property int capSmall: 65536
+  readonly property int capJson: 4194304
+
+  // Process identity for every action: pid plus its kernel start time, so a
+  // recycled pid can never receive a signal meant for an exited process.
+  function tok(p) {
+    if (!p || !(p.pid > 0)) return "0"
+    return (p.start > 0) ? (p.pid + ":" + p.start) : String(p.pid)
+  }
+
+  // Values spliced into Hyprland Lua dispatch strings: only plain integers
+  // and window addresses, so compositor data can never inject Lua.
+  function luaInt(v) {
+    var n = Math.round(Number(v))
+    return isFinite(n) ? String(Math.max(-1000000, Math.min(1000000, n))) : "0"
+  }
+  function safeAddr(a) {
+    return (/^0x[0-9a-fA-F]{1,16}$/.test(a || "")) ? a : ""
+  }
 
   // Icon font: an EXPLICIT Nerd Font family. Qt's "monospace" alias lets
   // fontconfig hand PUA codepoints to random fallback fonts (F0EE0 rendered
@@ -164,38 +241,74 @@ BarWidget {
   }
   Process {
     id: i18nLoader
-    command: ["bash", "-lc", "head -c 262144 '" + Qt.resolvedUrl("i18n.json").toString().replace("file://", "") + "'"]
+    command: root.capped(262144, 5, ["head", "-c", "262145", "--", Qt.resolvedUrl("i18n.json").toString().replace("file://", "")])
     running: true
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: { try { root.i18n = JSON.parse(text || "{}") } catch (e) {} }
+      onStreamFinished: { try { root.i18n = JSON.parse(root.clip(text, 262144) || "{}") } catch (e) {} }
     }
   }
 
   // Icon toggle button with an explicit monospace (Nerd Font) glyph —
   // qs.Ui Button's font has no MDI private-use glyphs (renders tofu).
   component IconBtn: Rectangle {
+    id: ib
     property string glyph: ""
     property bool active: false
+    property bool danger: false
+    // Shown under the button on hover (right-aligned: buttons sit at the
+    // card's right edge).
+    property string hint: ""
+    // Keyboard modifiers of the last click (SUPER+click = forced reset).
+    property int mods: 0
     signal clicked()
     width: 26
     height: 26
     radius: 5
-    color: active ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.16) : "transparent"
-    border.color: active ? Color.accent
-                         : Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.30)
+    z: ibMa.containsMouse ? 10 : 0
+    color: danger ? Qt.rgba(1, 0.42, 0.38, 0.18)
+                  : active ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.16) : "transparent"
+    border.color: danger ? "#ff6b60"
+                         : active ? Color.accent
+                                  : Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.30)
     border.width: 1
     Text {
+      textFormat: Text.PlainText
       anchors.centerIn: parent
       text: parent.glyph
-      color: parent.active ? Color.accent : Color.popups.text
+      color: parent.danger ? "#ff6b60" : parent.active ? Color.accent : Color.popups.text
       font.family: root.iconFont
       font.pixelSize: Style.font.body
     }
     MouseArea {
+      id: ibMa
       anchors.fill: parent
+      hoverEnabled: ib.hint !== ""
       cursorShape: Qt.PointingHandCursor
-      onClicked: parent.clicked()
+      onClicked: function(mouse) { ib.mods = mouse.modifiers; ib.clicked() }
+    }
+    Rectangle {
+      visible: ibMa.containsMouse && ib.hint !== ""
+      anchors.right: parent.right
+      anchors.top: parent.bottom
+      anchors.topMargin: 4
+      width: Math.min(hintText.implicitWidth, 280) + 12
+      height: hintText.implicitHeight + 8
+      radius: 4
+      color: Color.popups.background
+      border.color: ib.danger ? "#ff6b60" : Color.popups.border
+      border.width: 1
+      Text {
+        textFormat: Text.PlainText
+        id: hintText
+        anchors.centerIn: parent
+        width: Math.min(implicitWidth, 280)
+        text: ib.hint
+        color: Color.popups.text
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
     }
   }
 
@@ -222,6 +335,7 @@ BarWidget {
                                       rbMa.containsMouse ? 0.55 : 0.22))
     border.width: 1
     Text {
+      textFormat: Text.PlainText
       anchors.centerIn: parent
       text: parent.glyph
       color: parent.danger ? "#ff6b60" : (parent.accent ? Color.accent : Color.popups.text)
@@ -234,6 +348,129 @@ BarWidget {
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
       onClicked: parent.clicked()
+    }
+  }
+
+  // App icon from its desktop entry; a lettered tile when there is none.
+  component AppIcon: Item {
+    id: ai
+    property string cls: ""
+    property string name: ""
+    property bool dim: false
+    property int size: 20
+    implicitWidth: size
+    implicitHeight: size
+    Layout.alignment: Qt.AlignVCenter
+    readonly property string src: { root.iconEpoch; return root.iconFor(ai.cls, ai.name) }
+    Image {
+      id: aiImg
+      anchors.fill: parent
+      source: ai.src
+      sourceSize.width: ai.size * 2
+      sourceSize.height: ai.size * 2
+      asynchronous: true
+      smooth: true
+      visible: status === Image.Ready
+      opacity: ai.dim ? 0.45 : 1
+    }
+    Rectangle {
+      anchors.fill: parent
+      visible: aiImg.status !== Image.Ready
+      radius: 5
+      color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, ai.dim ? 0.10 : 0.22)
+      Text {
+        textFormat: Text.PlainText
+        anchors.centerIn: parent
+        text: (ai.name || "?").charAt(0).toUpperCase()
+        color: Color.popups.text
+        font.family: Style.font.family
+        font.pixelSize: Math.round(ai.size * 0.55)
+        font.bold: true
+      }
+    }
+  }
+
+  // Right-aligned number column: one width in the header and every row, so
+  // the CPU and RAM figures line up.
+  component ValueCell: Text {
+    property int cellWidth: 56
+    Layout.preferredWidth: cellWidth
+    Layout.minimumWidth: cellWidth
+    Layout.alignment: Qt.AlignVCenter
+    horizontalAlignment: Text.AlignRight
+    textFormat: Text.PlainText
+    font.family: Style.font.family
+    font.pixelSize: Style.font.caption
+    elide: Text.ElideLeft
+  }
+
+  // Small rounded tag ("PAUSED") and clickable filter chip.
+  component Pill: Rectangle {
+    property string label: ""
+    property color tint: Color.accent
+    implicitWidth: pillText.implicitWidth + 10
+    implicitHeight: pillText.implicitHeight + 2
+    radius: height / 2
+    color: Qt.rgba(tint.r, tint.g, tint.b, 0.18)
+    Text {
+      id: pillText
+      textFormat: Text.PlainText
+      anchors.centerIn: parent
+      text: parent.label
+      color: parent.tint
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption - 2
+      font.bold: true
+    }
+  }
+  component Chip: Rectangle {
+    id: chip
+    property string label: ""
+    property bool active: false
+    signal clicked()
+    implicitWidth: chipText.implicitWidth + 16
+    implicitHeight: 22
+    radius: 11
+    color: active ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18)
+                  : chipMa.containsMouse ? Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.08)
+                                         : "transparent"
+    border.color: active ? Color.accent : Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.25)
+    border.width: 1
+    Text {
+      id: chipText
+      textFormat: Text.PlainText
+      anchors.centerIn: parent
+      text: chip.label
+      color: chip.active ? Color.accent : Color.popups.text
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+    MouseArea {
+      id: chipMa
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: chip.clicked()
+    }
+  }
+  // Clickable column title; the active sort column carries the arrow.
+  component ColHead: Text {
+    property string key: ""
+    property int cellWidth: 56
+    property bool alignEnd: true
+    Layout.preferredWidth: cellWidth
+    Layout.minimumWidth: cellWidth
+    horizontalAlignment: alignEnd ? Text.AlignRight : Text.AlignLeft
+    textFormat: Text.PlainText
+    text: root.tr("col_" + key) + (root.sortBy === key ? (root.sortFlipped !== (key === "name") ? " ▴" : " ▾") : "")
+    color: root.sortBy === key ? Color.accent : Qt.darker(Color.popups.text, 1.4)
+    font.family: Style.font.family
+    font.pixelSize: Style.font.caption - 1
+    font.bold: true
+    MouseArea {
+      anchors.fill: parent
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.setSort(parent.key)
     }
   }
 
@@ -278,23 +515,32 @@ BarWidget {
 
   Process {
     id: scanProc
-    command: [root.binPath, "state"]
+    // Card closed: `--brief` skips the background/system scans nobody sees
+    // (the veils and the badge only need the windowed apps).
+    command: root.capped(root.capJson, 10, [root.binPath, "state"].concat(root.popupOpen ? [] : ["--brief"]))
     running: false
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.parseState(text)
+      onStreamFinished: {
+        root.parseState(root.clip(text, root.capJson))
+        root.settleEngine()
+        if (root.rescanWanted) {
+          root.rescanWanted = false
+          Qt.callLater(root.refresh)
+        }
+      }
     }
   }
 
   Process {
     id: histProc
-    command: [root.binPath, "history"]
+    command: root.capped(root.capJson, 10, [root.binPath, "history"])
     running: false
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         try {
-          root.hist = JSON.parse(text || "{}")
+          root.hist = JSON.parse(root.clip(text, root.capJson) || "{}")
         } catch (e) {}
       }
     }
@@ -302,7 +548,7 @@ BarWidget {
 
   Process {
     id: procsProc
-    command: [root.binPath, "procs", "0"]
+    command: root.capped(root.capJson, 10, [root.binPath, "procs", "0"])
     running: false
     stdout: StdioCollector {
       waitForEnd: true
@@ -311,7 +557,7 @@ BarWidget {
         // fresh array on every fetch rebuilds every expanded row, which
         // redraws the list and resets the scroll position.
         var pid = root.pendingProcsPid
-        var raw = (text || "[]").trim()
+        var raw = (root.clip(text, root.capJson) || "[]").trim()
         if (raw !== (root.procsRaw[pid] || "")) {
           var pr = root.procsRaw
           pr[pid] = raw
@@ -334,8 +580,12 @@ BarWidget {
 
   function runProcs(pid) {
     root.pendingProcsPid = pid
-    procsProc.command = [root.binPath, "procs", String(pid)]
+    procsProc.command = root.capped(root.capJson, 10, [root.binPath, "procs", root.tok(root.appByPid(pid))])
     procsProc.running = true
+  }
+  function appByPid(pid) {
+    for (var i = 0; i < root.allApps.length; i++) if (root.allApps[i].pid === pid) return root.allApps[i]
+    return { "pid": pid }
   }
 
   function fetchProcs(pid) {
@@ -344,41 +594,6 @@ BarWidget {
       return
     }
     root.runProcs(pid)
-  }
-
-  // Group live browser tabs by their chrome window: one header row per
-  // window (its active tab's title — that is what Hyprland shows), then the
-  // window's tabs in their real order. Window groups follow the compositor's
-  // window order where the active-tab title matches a window title.
-  function tabGroups(app) {
-    var tabs = app.tabs || []
-    if (!tabs.length) return []
-    var byWin = {}, order = []
-    for (var i = 0; i < tabs.length; i++) {
-      var w = tabs[i].win
-      if (!(w in byWin)) { byWin[w] = []; order.push(w) }
-      byWin[w].push(tabs[i])
-    }
-    var wins = app.wins || []
-    var ranked = []
-    for (var k = 0; k < wins.length; k++) {
-      var wt = (wins[k].title || "").replace(/ - (Google Chrome|Chromium|Brave( Software)?)$/, "")
-      for (var j = 0; j < order.length; j++) {
-        var act = byWin[order[j]].filter(function(t) { return t.active })[0]
-        if (act && act.title && (act.title === wt || wt.indexOf(act.title) === 0 || act.title.indexOf(wt) === 0)) {
-          ranked.push(order.splice(j, 1)[0]); break
-        }
-      }
-    }
-    order = ranked.concat(order)
-    var rows = []
-    for (var m = 0; m < order.length; m++) {
-      var grp = byWin[order[m]]
-      var active = grp.filter(function(t) { return t.active })[0]
-      rows.push({ header: true, title: active ? active.title : (grp[0].title || "") })
-      for (var q = 0; q < grp.length; q++) rows.push(grp[q])
-    }
-    return rows
   }
 
   function toggleExpand(pid) {
@@ -410,45 +625,152 @@ BarWidget {
     return h.apps[key].cpu[h.apps[key].cpu.length - 1]
   }
 
-  // List sort order: "ram" (default) / "cpu" / "name".
+  // List sort order: "ram" (default) / "cpu" / "name". Clicking the active
+  // column header again flips the direction (session only).
   property string sortBy: {
     var s = root.prefs["sortBy"]
     return (s === "cpu" || s === "name") ? s : "ram"
   }
+  property bool sortFlipped: false
   function cycleSort() {
-    setPref("sortBy", sortBy === "ram" ? "cpu" : (sortBy === "cpu" ? "name" : "ram"))
+    setSort(sortBy === "ram" ? "cpu" : (sortBy === "cpu" ? "name" : "ram"))
+  }
+  function setSort(by) {
+    if (by === root.sortBy) {
+      root.sortFlipped = !root.sortFlipped
+    } else {
+      root.sortFlipped = false
+      setPref("sortBy", by)
+    }
+    root.applyView()
+  }
+  function sortRows(arr) {
+    var sb = root.sortBy, flip = root.sortFlipped ? -1 : 1
+    return arr.slice().sort(function(a, b) {
+      var d = sb === "name" ? a.name.localeCompare(b.name)
+            : sb === "cpu" ? cpuVal(b.hkey || b.unit, b.pid) - cpuVal(a.hkey || a.unit, a.pid)
+            : (b.rss_mb + (b.swap_mb || 0)) - (a.rss_mb + (a.swap_mb || 0))
+      return d * flip
+    })
   }
 
-  // Last N samples of an app's RSS series as 0..1 fractions. Normalized
-  // against the FULL-series max: a sliding-window max rescales every bar on
-  // each poll (the "flicker"), a stable max doesn't.
+  // Search box + quick filters ("all" | "paused" | "cpu" | "ram"), applied
+  // to every list on the client side.
+  readonly property int cpuColW: 48
+  readonly property int ramColW: 66
+  property string filterText: ""
+  property string quickFilter: "all"
+  onFilterTextChanged: root.applyView()
+  onQuickFilterChanged: root.applyView()
+  function rowMatches(r) {
+    var q = root.filterText.trim().toLowerCase()
+    if (q !== "" && (r.name + " " + (r.title || "") + " " + r.pid).toLowerCase().indexOf(q) < 0)
+      return false
+    if (root.quickFilter === "paused") return !!r.frozen
+    if (root.quickFilter === "cpu") return cpuVal(r.hkey || r.unit, r.pid) >= 5
+    if (root.quickFilter === "ram") return (r.rss_mb || 0) >= 500
+    return true
+  }
+  property var allApps: []
+  property var allBackground: []
+  property var allSystem: []
+  function applyView() {
+    root.apps = root.sortRows(root.allApps.filter(root.rowMatches))
+    root.reconcileApps(root.apps)
+    root.background = root.sortRows(root.allBackground.filter(root.rowMatches))
+    root.system = root.quickFilter === "all" || root.quickFilter === "ram"
+                  ? root.allSystem.filter(root.rowMatches) : []
+  }
+
+  // App icons from the desktop entries (window class first, then the
+  // process name); a lettered tile when no entry is found.
+  property var iconCache: ({})
+  property int iconEpoch: 0
+  function iconFor(cls, name) {
+    var key = (cls || "") + "|" + (name || "")
+    if (root.iconCache[key] !== undefined) return root.iconCache[key]
+    var src = ""
+    var tries = [cls, cls ? cls.toLowerCase() : "", name]
+    for (var i = 0; i < tries.length && src === ""; i++) {
+      if (!tries[i]) continue
+      var e = DesktopEntries.heuristicLookup(tries[i])
+      if (e && e.icon) src = Quickshell.iconPath(e.icon, true)
+      if (src === "") src = Quickshell.iconPath(tries[i], true)
+    }
+    // Entries load asynchronously: remember misses only once they exist.
+    if (src !== "" || DesktopEntries.applications.values.length > 0) root.iconCache[key] = src
+    return src
+  }
+  Connections {
+    target: DesktopEntries.applications
+    function onValuesChanged() { root.iconCache = ({}); root.iconEpoch++ }
+  }
+
+  // Value colours: calm text, then warmer as a row weighs more.
+  function cpuColor(v) {
+    return v >= 50 ? "#f7768e" : v >= 15 ? "#ff9e64" : v >= 5 ? "#e0af68" : Color.popups.text
+  }
+  // Sparkline bar colour: the CPU column's scale for that sample, so a
+  // past spike reads at a glance; dimmed for frozen and system rows.
+  function sparkColor(frac, muted) {
+    var c = root.cpuColor(frac * 100)
+    return muted ? Qt.darker(c, 1.6) : c
+  }
+  function memColor(mb) {
+    return mb >= 2048 ? "#f7768e" : mb >= 1024 ? "#ff9e64" : mb >= 400 ? "#e0af68" : Color.popups.text
+  }
+  function usageColor(pct) {
+    return pct >= 90 ? "#f7768e" : pct >= 75 ? "#ff9e64" : pct >= 50 ? "#e0af68" : "#9ece6a"
+  }
+  function fmtMem(mb) {
+    return mb >= 1024 ? (mb / 1024).toFixed(mb >= 10240 ? 0 : 1) + " GB" : Math.round(mb) + " MB"
+  }
+
+  // Last N samples of an app's CPU series as 0..1 fractions on a fixed
+  // 0-100% scale (same units as the CPU column, % of one core like top): a
+  // full bar is a whole core, so rows compare and nothing rescales.
   function sparkFor(unit, pid, n) {
     var key = (unit && unit.length > 0) ? unit : ("pid" + pid)
     var h = root.hist
     if (!h || !h.apps || !h.apps[key]) return []
-    var series = h.apps[key].rss || []
+    var series = h.apps[key].cpu || []
     if (series.length === 0) return []
-    var max = 1
-    for (var i = 0; i < series.length; i++) if (series[i] > max) max = series[i]
     var out = []
     var start = Math.max(0, series.length - n)
-    for (var j = start; j < series.length; j++) out.push(series[j] / max)
+    for (var j = start; j < series.length; j++) out.push(Math.max(0, Math.min(1, series[j] / 100)))
     return out
+  }
+
+  // Engine hints carry their numbers; the words come from i18n.json so
+  // they follow the card's language. "text" is the English fallback.
+  function sugText(sg) {
+    if (sg.kind === "sleeper" && sg.name !== undefined)
+      return root.tr("sugSleeper").arg(sg.name).arg(sg.swap_mb)
+    if (sg.kind === "governor" && sg.count !== undefined)
+      return root.tr("sugGovernor").arg(sg.count).arg(sg.names)
+    return sg.text || ""
   }
 
   function parseState(text) {
     try {
       var data = JSON.parse(text)
-      var arr = data.apps || []
-      var sb = root.sortBy
-      arr.sort(function(a, b) {
-        if (sb === "name") return a.name.localeCompare(b.name)
-        if (sb === "cpu") return cpuVal(b.unit, b.pid) - cpuVal(a.unit, a.pid)
-        return b.rss_mb - a.rss_mb
-      })
-      root.apps = arr          // logic/keyboard source (sorted)
-      root.reconcileApps(arr)  // view model: delegates update IN PLACE
-      root.system = data.system || []
+      root.engineKind = data.engine === "python" ? "python" : "rust"
+      root.allApps = data.apps || []
+      // A brief scan (card closed) carries no background/system rows: keep
+      // the last full lists so the card never opens on empty sections.
+      if (!root.scanBrief) {
+        // History key of each group: "bg:<name>" (its biggest pid changes
+        // between ticks, the name doesn't; a shared scope would mix in the
+        // windowed app's CPU). Matches the engines' sample_history.
+        var bgRows = data.background || []
+        for (var bi = 0; bi < bgRows.length; bi++)
+          bgRows[bi].hkey = "bg:" + bgRows[bi].name
+        root.allBackground = bgRows
+        var sysRows = data.system || []
+        for (var si = 0; si < sysRows.length; si++)
+          sysRows[si].hkey = "sys:" + sysRows[si].name
+        root.allSystem = sysRows
+      }
       root.monitors = data.monitors || []
       // Workspaces currently shown on some monitor. A frozen window on a
       // HIDDEN workspace (scratchpad/special, another ws) must not get a
@@ -461,8 +783,8 @@ BarWidget {
         activeWs[root.monitors[mi].active_ws] = true
       var n = 0
       var fw = []
-      for (var i = 0; i < root.apps.length; i++) {
-        var a = root.apps[i]
+      for (var i = 0; i < root.allApps.length; i++) {
+        var a = root.allApps[i]
         if (a.frozen) {
           n++
           var wins = a.wins || []
@@ -473,7 +795,7 @@ BarWidget {
             fw.push({
               "addr": w.addr, "x": w.x, "y": w.y, "w": w.w, "h": w.h,
               "ws": w.ws, "mon": w.mon, "pinned": w.pinned,
-              "app": a.name, "pid": a.pid
+              "app": a.name, "pid": a.pid, "start": a.start || 0
             })
           }
         }
@@ -495,9 +817,11 @@ BarWidget {
         root.zramBacked = !!data.zswap.zram
       }
       if (data.pressure) root.pressureCritical = !!data.pressure.critical
-      root.background = data.background || []
       root.suggestions = data.suggestions || []
       root.prefs = data.prefs || {}
+      root.memUsedPct = root.memTotalMb > 0 ? Math.round((root.memTotalMb - root.memAvailMb) * 100 / root.memTotalMb) : 0
+      root.swapTotalMb = data.mem ? (data.mem.swap_total_mb || 0) : 0
+      root.applyView()
       if (data.now) {
         root.cpuNow = data.now.cpu || 0.0
         root.memNow = data.now.mem || 0.0
@@ -515,45 +839,42 @@ BarWidget {
         root.writePopupState(true)
       }
     } catch (e) {
+      root.allApps = []
       root.apps = []
       root.frozenWins = []
       root.frozenCount = 0
     }
   }
 
+  // "rust" or "python": which engine answered the last scan.
+  property string engineKind: ""
+  property int memUsedPct: 0
+  property int swapTotalMb: 0
+  property bool scanBrief: false
+  property bool rescanWanted: false
   function refresh() {
-    if (!scanProc.running) scanProc.running = true
+    if (scanProc.running) { root.rescanWanted = true; return }
+    root.scanBrief = !root.popupOpen
+    scanProc.running = true
   }
 
   function refreshHistory() {
-    if (!histProc.running) histProc.running = true
+    if (root.engineReady && !histProc.running) histProc.running = true
   }
 
-  function action(verb, pid) {
-    Quickshell.execDetached([root.binPath, verb, String(pid)])
+  // `target` is the process object from the engine's JSON (pid + start).
+  function action(verb, target) {
+    if (!root.engineReady) return
+    Quickshell.execDetached([root.binPath, verb, root.tok(target)])
     settleTimer.restart()
     // Thaw does NOT steal focus: the user clicks the window (or the row's
     // name) when THEY want it focused.
   }
 
-  // Unload a browser tab (free its memory; it reloads on focus) via the
-  // native bridge: helper queues the command, the tabs host forwards it to
-  // the extension, chrome.tabs.discard does the rest.
-  function tabDiscard(tabId) {
-    Quickshell.execDetached([root.binPath, "tabs-cmd", "discard", String(tabId)])
-    settleTimer.restart()
-  }
-
-  // Discard every background tab in one go (suggestion action).
-  function tabDiscardAll() {
-    Quickshell.execDetached([root.binPath, "tabs-cmd", "discard-background", "0"])
-    settleTimer.restart()
-  }
-
   function resumeAll() {
-    for (var i = 0; i < root.apps.length; i++) {
-      if (root.apps[i].frozen) {
-        Quickshell.execDetached([root.binPath, "thaw", String(root.apps[i].pid)])
+    for (var i = 0; i < root.allApps.length; i++) {
+      if (root.allApps[i].frozen) {
+        root.action("thaw", root.allApps[i])
       }
     }
     settleTimer.restart()
@@ -581,11 +902,51 @@ BarWidget {
     return win.ws === m.active_ws
   }
 
-  function copyZswapCmd() {
-    Quickshell.execDetached([root.binPath, "zswap-copy"])
+  // --- emergency tools: stuck windows and a stuck shell --------------------
+  // Click-to-kill is Hyprland's own kill mode (xkill for Wayland): the next
+  // click SIGKILLs the clicked window's process, Esc cancels. Compositor-
+  // side, so it works on apps too hung to answer anything. The card is a
+  // full-screen layer and would catch that click itself: close it first.
+  Timer {
+    id: killModeTimer
+    interval: 250
+    onTriggered: Quickshell.execDetached(["hyprctl", "kill"])
+  }
+  function killByClick() {
+    root.closePopup()
+    killModeTimer.restart()
+  }
+
+  // Shell reset: omarchy-restart-shell. Holding SUPER (or having pressed it
+  // in the last few seconds, in case Hyprland's SUPER+drag bind eats the
+  // click) turns it into the forced reset: shell, supervisor and helpers
+  // SIGKILLed, then a fresh shell. The engine detaches into its own session
+  // first, since this shell is the one about to die.
+  property bool superHeld: false
+  readonly property bool forceArmed: root.superHeld || forceArmTimer.running
+  Timer {
+    id: forceArmTimer
+    interval: 4000
+  }
+  function isSuperKey(key) {
+    return key === Qt.Key_Super_L || key === Qt.Key_Super_R || key === Qt.Key_Meta
+  }
+  function shellReset(mods) {
+    var force = root.forceArmed || (mods & Qt.MetaModifier) !== 0
+    root.superHeld = false
+    forceArmTimer.stop()
+    // Without the engine the normal reset still works: it is Omarchy's own.
+    if (!root.engineReady) {
+      Quickshell.execDetached(["omarchy-restart-shell"])
+      return
+    }
+    Quickshell.execDetached(force ? [root.binPath, "shell-reset", "force"]
+                                  : [root.binPath, "shell-reset"])
   }
 
   function closePopup() {
+    root.superHeld = false
+    forceArmTimer.stop()
     root.dismissedAt = Date.now()
     root.writePopupState(false)
   }
@@ -610,10 +971,11 @@ BarWidget {
     if (root.popupOpen) {
       // Resolve the cursor's monitor fresh on every open.
       if (!cursorScreenProc.running) cursorScreenProc.running = true
-      // No ownership yet? Re-probe: a stale token (dead owner instance) is
-      // claimable now, so the popup can actually render.
-      if (!root.veilOwner && !veilClaim.running) veilClaim.running = true
+      // No ownership yet? Re-probe: a dead owner instance is claimable now,
+      // so the popup can actually render.
+      if (!root.veilOwner) root.veilOwner = Shared.claim(root)
       if (!root.cardPosSet) root.centerCard()
+      root.refresh()
       root.refreshHistory()
       root.readKeybind()
       root.selIdx = (root.apps.length + root.background.length) ? 0 : -1
@@ -647,6 +1009,9 @@ BarWidget {
   }
 
   function handleCardKey(ev) {
+    if (root.isSuperKey(ev.key)) { root.superHeld = true; return }
+    if (ev.key === Qt.Key_K) { root.killByClick(); ev.accepted = true; return }
+    if (ev.key === Qt.Key_Slash) { searchField.forceActiveFocus(); ev.accepted = true; return }
     if (ev.key === Qt.Key_Escape) {
       if (root.prefsOpen) { root.prefsOpen = false } else { root.closePopup() }
       ev.accepted = true; return
@@ -680,10 +1045,10 @@ BarWidget {
     if (root.selIdx >= na) {
       var bg = root.background[root.selIdx - na]
       if (ev.key === Qt.Key_Space || ev.key === Qt.Key_P) {
-        root.action(bg.frozen ? "thaw" : "freeze", bg.pid)
+        root.action(bg.frozen ? "thaw" : "freeze", bg)
         ev.accepted = true
       } else if (ev.key === Qt.Key_X || ev.key === Qt.Key_Delete) {
-        root.action("kill", bg.pid)
+        root.action("kill", bg)
         ev.accepted = true
       }
       return
@@ -694,13 +1059,13 @@ BarWidget {
     } else if (ev.key === Qt.Key_Left && root.expandedProcs[app.pid]) {
       root.toggleExpand(app.pid); ev.accepted = true
     } else if (ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter) {
-      Quickshell.execDetached([root.binPath, "focus", String(app.pid)])
+      root.action("focus", app)
       ev.accepted = true
     } else if (ev.key === Qt.Key_Space || ev.key === Qt.Key_P) {
-      root.action(app.frozen ? "thaw" : "freeze", app.pid)
+      root.action(app.frozen ? "thaw" : "freeze", app)
       ev.accepted = true
     } else if (ev.key === Qt.Key_X || ev.key === Qt.Key_Delete) {
-      root.action("kill", app.pid)
+      root.action("kill", app)
       ev.accepted = true
     }
   }
@@ -722,32 +1087,57 @@ BarWidget {
     function toggle(): void { root.writePopupState(!root.popupOpen) }
   }
 
-  // --- SUPER+SHIFT+T keybind (OPT-IN; marketplace-safe) --------------------
-  // The helper writes/removes the hyprland lua ONLY on explicit user action
-  // (this card's keyboard toggle). install.sh never enables it.
-  property string kbScript: root.binPath.replace("task-manager-launch.sh", "task-manager-keybind.sh")
+  // --- optional Hyprland additions (keybinds, veil rule) -------------------
+  // Nothing is written from here. "Apply"/"Remove" open a terminal where
+  // bin/task-manager-configure.sh shows the exact change to ~/.config/hypr
+  // and asks first. Bind status is read back from Hyprland itself (`binds`).
+  // The reset bind embeds the plugin path in a Lua string: offered only for
+  // paths that need no escaping.
+  readonly property bool launcherPathSafe: /^\/[A-Za-z0-9._\/+@-]+$/.test(root.binDir)
+  // "Apply"/"Remove": a terminal explains what will change in the user's
+  // Hyprland config and asks before touching anything
+  // (bin/task-manager-configure.sh). Arguments are fixed words; the script
+  // path is checked to need no quoting, since the launcher runs it via bash.
+  readonly property string configurePath: root.binDir + "/task-manager-configure.sh"
+  function configure(what, action) {
+    if (!/^\/[A-Za-z0-9._\/+@-]+$/.test(root.configurePath)) return
+    if (["show", "reset", "veil"].indexOf(what) < 0 || ["apply", "remove"].indexOf(action) < 0) return
+    root.closePopup()
+    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation",
+                             root.configurePath + " " + what + " " + action])
+    bindsRecheck.count = 0
+    bindsRecheck.restart()
+  }
+  // Pick up the result once the user answered (Hyprland reloads on change).
+  Timer {
+    id: bindsRecheck
+    property int count: 0
+    interval: 2000
+    repeat: true
+    onTriggered: {
+      root.readKeybind()
+      if (++count >= 45) stop()
+    }
+  }
   property bool keybindOn: false
-
+  property bool resetKeybindOn: false
   Process {
-    id: kbProc
-    command: [root.kbScript, "status"]
+    id: bindsProc
+    command: root.capped(root.capSmall, 5, [root.binPath, "binds"])
     running: false
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.keybindOn = (text || "").trim() === "enabled"
+      onStreamFinished: {
+        try {
+          var b = JSON.parse(root.clip(text, root.capSmall) || "{}")
+          root.keybindOn = b.show === true
+          root.resetKeybindOn = b.reset === true
+        } catch (e) {}
+      }
     }
   }
-  Timer {
-    id: kbRecheck
-    interval: 1500
-    repeat: false
-    onTriggered: root.readKeybind()
-  }
-  function readKeybind() { if (!kbProc.running) kbProc.running = true }
-  function toggleKeybind() {
-    root.keybindOn = !root.keybindOn  // optimistic; re-checked after write
-    Quickshell.execDetached([root.kbScript, "toggle"])
-    kbRecheck.restart()
+  function readKeybind() {
+    if (root.engineReady && !bindsProc.running) bindsProc.running = true
   }
 
   // --- Hyprland "Application Not Responding" suppression -------------------
@@ -762,14 +1152,14 @@ BarWidget {
 
   Process {
     id: anrProc
-    command: ["hyprctl", "getoption", "misc:anr_missed_pings", "-j"]
+    command: root.capped(root.capSmall, 2, ["hyprctl", "getoption", "misc:anr_missed_pings", "-j"])
     running: true
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         try {
-          var v = JSON.parse(text).int
-          if (v > 0) root.anrOriginal = v
+          var v = JSON.parse(root.clip(text, root.capSmall)).int
+          if (Number.isInteger(v) && v > 0 && v <= 100000) root.anrOriginal = v
         } catch (e) {}
       }
     }
@@ -781,61 +1171,43 @@ BarWidget {
       Quickshell.execDetached(["hyprctl", "eval", "hl.config({ misc = { anr_missed_pings = 99999 } })"])
     } else if (root.frozenCount === 0 && root.anrSuppressed) {
       root.anrSuppressed = false
-      Quickshell.execDetached(["hyprctl", "eval", "hl.config({ misc = { anr_missed_pings = " + root.anrOriginal + " } })"])
+      Quickshell.execDetached(["hyprctl", "eval", "hl.config({ misc = { anr_missed_pings = " + root.luaInt(root.anrOriginal) + " } })"])
     }
   }
 
-  // --- ONE persistent veil surface per screen, created at shell start. ---
-  // Layer surfaces stack by creation order within a layer: because this
-  // surface exists from boot, panels opened LATER (X-Panel, etc.) render
-  // ABOVE it, while app windows (always below the Top layer) stay below.
-  // mask: empty Region = click-through (the pill opens the manager).
-  // --- ONE persistent veil surface per screen, created at shell start. ---
-  // The shell preloads a second (ghost) BarWidget instance whose IpcHandler
-  // never wins; without a guard BOTH instances would paint identical veils
-  // (the visible "double layer" = doubled alpha). Claim ownership with a
-  // pid-liveness lock; only the winner renders veils. Same-process
-  // instances share $PPID, so a random token breaks the tie and the
-  // write-then-reread closes the race.
+  // --- owner election (in memory, Shared.js) -------------------------------
+  // The shell preloads a second (ghost) BarWidget instance; without a guard
+  // BOTH would paint the card and identical veils (doubled alpha) and run
+  // the background helpers twice. The first live instance owns all of it;
+  // when it goes away (plugin reload) the next claim hands ownership over.
+  readonly property bool alive: true
   property bool veilOwner: false
-  property string veilToken: ""
-  // Claim ownership unless the recorded owner is provably alive: live pid AND
-  // a fresh heartbeat (owner rewrites its token every 5s). A dead instance
-  // under a live shell pid (QML hot-reload, plugin reload) leaves a stale
-  // token; the freshness check lets the next claimant take over instead of
-  // leaving popup+veils silently dead until the shell restarts.
-  Process {
-    id: veilClaim
-    running: true
-    command: ["sh", "-c", "O=\"$XDG_RUNTIME_DIR/tm-veil-owner\"; R=$(head -c4 /dev/urandom | od -An -tx4 | tr -d ' '); P=$(cat \"$O\" 2>/dev/null); NOW=$(date +%s); MT=$(stat -c %Y \"$O\" 2>/dev/null || echo 0); if [ -n \"$P\" ] && kill -0 \"${P%%:*}\" 2>/dev/null && [ $(( NOW - MT )) -lt 12 ]; then echo busy; else echo \"$PPID:$R\" > \"$O\"; sleep 0.2; [ \"$(cat \"$O\" 2>/dev/null)\" = \"$PPID:$R\" ] && echo \"owned:$PPID:$R\" || echo busy; fi"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var t = (text || "").trim()
-        if (t.indexOf("owned:") === 0) {
-          root.veilToken = t.substring(6)
-          root.veilOwner = true
-        } else {
-          root.veilOwner = false
-        }
-      }
-    }
-  }
-  // Owner heartbeat: rewrite the token so other instances see a fresh owner.
-  // If the file no longer holds our token, another instance displaced us.
   Timer {
-    interval: 5000
+    interval: 2000
     repeat: true
-    running: root.veilOwner && root.veilToken !== ""
-    onTriggered: if (!veilHeartbeat.running) veilHeartbeat.running = true
+    running: !root.veilOwner
+    onTriggered: root.veilOwner = Shared.claim(root)
   }
+  Component.onDestruction: Shared.unregister(root)
+
+  // Watchdog + memory governor: a child of this shell, only in the owner.
+  // `--lifeline` makes the engine release every limit it set and resume
+  // everything it paused as soon as the shell (its stdin) goes away.
+  property bool watchDead: false
   Process {
-    id: veilHeartbeat
-    command: ["sh", "-c", "O=\"$XDG_RUNTIME_DIR/tm-veil-owner\"; printf '%s' \"" + root.veilToken + "\" > \"$O\"; sleep 0.1; [ \"$(cat \"$O\" 2>/dev/null)\" = \"" + root.veilToken + "\" ] && echo ok || echo lost"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: if ((text || "").trim() === "lost") root.veilOwner = false
+    id: watchProc
+    running: root.veilOwner && root.engineSettled && !root.watchDead && root.pref("watchdog", true)
+    command: [root.binPath, "watch", "--lifeline"]
+    stdinEnabled: true
+    onExited: {
+      root.watchDead = true
+      watchRestart.restart()
     }
+  }
+  Timer {
+    id: watchRestart
+    interval: 10000
+    onTriggered: root.watchDead = false
   }
 
   // Cursor position for the veil mascots while the popup is closed (veils
@@ -845,16 +1217,16 @@ BarWidget {
     id: cursorPoll
     interval: 120
     repeat: true
-    running: root.frozenCount > 0 && !root.popupOpen
+    running: root.frozenCount > 0 && !root.popupOpen && root.veilOwner && root.veilsOn
     onTriggered: if (!cursorPosProc.running) cursorPosProc.running = true
   }
   Process {
     id: cursorPosProc
-    command: ["hyprctl", "cursorpos"]
+    command: root.capped(256, 2, ["hyprctl", "cursorpos"])
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var m = /(-?\d+)[, ]+\s*(-?\d+)/.exec(text || "")
+        var m = /^(-?\d{1,6})[, ]+\s*(-?\d{1,6})\s*$/.exec(root.clip(text, 256))
         if (m) {
           root.cursorX = parseInt(m[1])
           root.cursorY = parseInt(m[2])
@@ -865,17 +1237,21 @@ BarWidget {
   }
 
   // --- Veils as REAL floating windows (compositor z-order, not a layer) ---
-  // One FloatingWindow per frozen window, floated at open by the config rule
-  // in hypr/task-manager-bindings.lua (title matching fails at open; rules
-  // via hyprctl eval never apply). The compositor stacks veils naturally:
+  // One FloatingWindow per frozen window, floated at open by the user's
+  // window rule (the veil rule from the gear panel; title matching fails at open, rules via
+  // hyprctl eval never apply). The compositor stacks veils naturally:
   // windows opened or raised later simply paint OVER the veil — no clipping
   // shapes. A slow poll follows workspace/geometry (dispatchers work on
   // existing windows) and re-tops the veil if the frozen window got raised
   // above it (hide+show re-stacks on top).
   property string veilRetop: ""
+  // Veils need the window rule from the gear panel (Apply rule) in the
+  // user's Hyprland config; without it they would open as tiled windows.
+  // So they stay off until the user turns them on there.
+  readonly property bool veilsOn: root.pref("veils", false) === true
 
   Variants {
-    model: root.veilOwner ? root.frozenWins : []
+    model: (root.veilOwner && root.veilsOn) ? root.frozenWins : []
     delegate: FloatingWindow {
       id: veilWin
       required property var modelData
@@ -897,22 +1273,24 @@ BarWidget {
         interval: 70
         repeat: true
         onTriggered: {
-          var sel = "title:^tm-veil:" + win.addr + "$"
+          var addr = root.safeAddr(win.addr)
+          if (addr === "") { stop(); return }
+          var sel = "title:^tm-veil:" + addr + "$"
           Quickshell.execDetached(["hyprctl", "dispatch",
-            "hl.dsp.window.move({ x = " + win.x + ", y = " + win.y + ", window = \"" + sel + "\" })"])
+            "hl.dsp.window.move({ x = " + root.luaInt(win.x) + ", y = " + root.luaInt(win.y) + ", window = \"" + sel + "\" })"])
           Quickshell.execDetached(["hyprctl", "dispatch",
-            "hl.dsp.window.resize({ window = \"" + sel + "\", x = " + win.w + ", y = " + win.h + " })"])
+            "hl.dsp.window.resize({ window = \"" + sel + "\", x = " + root.luaInt(win.w) + ", y = " + root.luaInt(win.h) + " })"])
           if (!veilPlaceCheck.running) veilPlaceCheck.running = true
         }
       }
       Process {
         id: veilPlaceCheck
-        command: ["hyprctl", "clients", "-j"]
+        command: root.capped(root.capJson, 3, ["hyprctl", "clients", "-j"])
         stdout: StdioCollector {
           waitForEnd: true
           onStreamFinished: {
             try {
-              var cs = JSON.parse(text)
+              var cs = JSON.parse(root.clip(text, root.capJson))
               for (var i = 0; i < cs.length; i++) {
                 if (cs[i].initialTitle === "tm-veil:" + win.addr
                     && Math.abs(cs[i].at[0] - win.x) < 4
@@ -971,8 +1349,8 @@ BarWidget {
             root.cursorY = win.y + mouse.y
             root.cursorValid = true
           }
-          onClicked: Quickshell.execDetached(["hyprctl", "dispatch",
-            "hl.dsp.focus({ window = \"address:" + win.addr + "\" })"])
+          onClicked: if (root.safeAddr(win.addr) !== "") Quickshell.execDetached(["hyprctl", "dispatch",
+            "hl.dsp.focus({ window = \"address:" + root.safeAddr(win.addr) + "\" })"])
         }
 
         Column {
@@ -1000,7 +1378,7 @@ BarWidget {
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
-              onClicked: Quickshell.execDetached([root.binPath, "thaw", String(win.pid)])
+              onClicked: root.action("thaw", win)
             }
           }
           // Order: Omi, APP NAME (3x, inverse block), PAUSED.
@@ -1011,6 +1389,7 @@ BarWidget {
             radius: Style.cornerRadius - 2
             color: "#9ece6a"  // brand green: the veil's opposite
             Text {
+              textFormat: Text.PlainText
               id: veilName
               anchors.centerIn: parent
               text: win.app
@@ -1021,6 +1400,7 @@ BarWidget {
             }
           }
           Text {
+            textFormat: Text.PlainText
             anchors.horizontalCenter: parent.horizontalCenter
             text: root.tr("pausedTag")
             color: "#ffffff"
@@ -1039,10 +1419,12 @@ BarWidget {
   property bool veilEventsDead: false
   Process {
     id: veilEventsProc
-    running: root.veilOwner && root.frozenCount > 0 && !root.veilEventsDead
+    running: root.veilOwner && root.veilsOn && root.engineSettled && root.frozenCount > 0 && !root.veilEventsDead
     command: [root.binPath, "follow"]
     stdout: SplitParser {
       onRead: data => {
+        // The engine caps event lines; anything longer is not one of ours.
+        if (data.length > 4096) return
         if (data.startsWith("activewindowv2>>")) {
           // Event addresses lack the 0x prefix clients JSON carries.
           var addr = "0x" + data.substring(16).trim()
@@ -1086,17 +1468,18 @@ BarWidget {
   Timer {
     interval: root.veilHoverCount > 0 ? 120 : 400
     repeat: true
-    running: root.veilOwner && root.frozenCount > 0
+    running: root.veilOwner && root.veilsOn && root.frozenCount > 0
     onTriggered: if (!veilSyncProc.running) veilSyncProc.running = true
   }
   Process {
     id: veilSyncProc
-    command: ["hyprctl", "clients", "-j"]
+    command: root.capped(root.capJson, 3, ["hyprctl", "clients", "-j"])
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         try {
-          var cs = JSON.parse(text)
+          var cs = JSON.parse(root.clip(text, root.capJson))
+          if (!Array.isArray(cs)) return
           var sync = root.veilSync
           for (var i = 0; i < root.frozenWins.length; i++) {
             var w = root.frozenWins[i]
@@ -1115,30 +1498,32 @@ BarWidget {
             }
             var winChanged = !eq(rr, last)
             var veilChanged = !eq(vr, last)
-            var vsel = "title:^tm-veil:" + w.addr + "$"
-            var wsel = "address:" + w.addr
+            var addr = root.safeAddr(w.addr)
+            if (addr === "") continue
+            var vsel = "title:^tm-veil:" + addr + "$"
+            var wsel = "address:" + addr
             if (veilChanged && !winChanged && rw.floating) {
               // The user dragged/resized the VEIL: glue the real window to
               // it. Only possible when the frozen window is FLOATING —
               // tiled windows are owned by the layout, so there the veil
               // just snaps back (else branch).
               Quickshell.execDetached(["hyprctl", "dispatch",
-                "hl.dsp.window.move({ x = " + vr.x + ", y = " + vr.y + ", window = \"" + wsel + "\" })"])
+                "hl.dsp.window.move({ x = " + root.luaInt(vr.x) + ", y = " + root.luaInt(vr.y) + ", window = \"" + wsel + "\" })"])
               Quickshell.execDetached(["hyprctl", "dispatch",
-                "hl.dsp.window.resize({ window = \"" + wsel + "\", x = " + vr.w + ", y = " + vr.h + " })"])
+                "hl.dsp.window.resize({ window = \"" + wsel + "\", x = " + root.luaInt(vr.w) + ", y = " + root.luaInt(vr.h) + " })"])
               sync[w.addr] = vr
             } else {
               // Default: the veil follows the window (geometry + workspace).
               if (winChanged || !eq(vr, rr)) {
                 Quickshell.execDetached(["hyprctl", "dispatch",
-                  "hl.dsp.window.move({ x = " + rr.x + ", y = " + rr.y + ", window = \"" + vsel + "\" })"])
+                  "hl.dsp.window.move({ x = " + root.luaInt(rr.x) + ", y = " + root.luaInt(rr.y) + ", window = \"" + vsel + "\" })"])
                 Quickshell.execDetached(["hyprctl", "dispatch",
-                  "hl.dsp.window.resize({ window = \"" + vsel + "\", x = " + rr.w + ", y = " + rr.h + " })"])
+                  "hl.dsp.window.resize({ window = \"" + vsel + "\", x = " + root.luaInt(rr.w) + ", y = " + root.luaInt(rr.h) + " })"])
               }
               if (!w.pinned && rw.workspace && vw.workspace
                   && rw.workspace.id !== vw.workspace.id)
                 Quickshell.execDetached(["hyprctl", "dispatch",
-                  "hl.dsp.window.move({ workspace = \"" + rw.workspace.id + "\", follow = false, window = \"" + vsel + "\" })"])
+                  "hl.dsp.window.move({ workspace = \"" + root.luaInt(rw.workspace.id) + "\", follow = false, window = \"" + vsel + "\" })"])
               sync[w.addr] = rr
             }
           }
@@ -1150,12 +1535,12 @@ BarWidget {
   }
   Process {
     id: veilActiveWinProc
-    command: ["hyprctl", "activewindow", "-j"]
+    command: root.capped(root.capSmall, 2, ["hyprctl", "activewindow", "-j"])
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         try {
-          var a = JSON.parse(text)
+          var a = JSON.parse(root.clip(text, root.capSmall))
           var addr = a.address || ""
           // Fire only on the TRANSITION into focusing a frozen window;
           // re-firing while it stays focused flaps the veil every poll.
@@ -1181,11 +1566,11 @@ BarWidget {
   property var popupScreen: null
   Process {
     id: cursorScreenProc
-    command: ["hyprctl", "cursorpos"]
+    command: root.capped(256, 2, ["hyprctl", "cursorpos"])
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var m = /(-?\d+)[, ]+\s*(-?\d+)/.exec(text || "")
+        var m = /^(-?\d{1,6})[, ]+\s*(-?\d{1,6})\s*$/.exec(root.clip(text, 256))
         if (!m) return
         var cx = parseInt(m[1]), cy = parseInt(m[2])
         for (var i = 0; i < root.monitors.length; i++) {
@@ -1267,6 +1652,12 @@ BarWidget {
       // Keyboard navigation focus target (see root.handleCardKey).
       focus: root.popupOpen
       Keys.onPressed: function(ev) { root.handleCardKey(ev) }
+      Keys.onReleased: function(ev) {
+        if (root.isSuperKey(ev.key) && root.superHeld) {
+          root.superHeld = false
+          forceArmTimer.restart()
+        }
+      }
 
       // Interceptor: swallows clicks on card padding so the full-screen
       // close area behind the card does not fire. Also feeds cursor tracking
@@ -1289,6 +1680,7 @@ BarWidget {
         RowLayout {
           Layout.fillWidth: true
           spacing: Style.space(8)
+          z: 5  // button hints overlap the rows below
 
           // Drag zone (left): grab the header to move the card.
           Item {
@@ -1303,6 +1695,7 @@ BarWidget {
               spacing: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
               Text {
+                textFormat: Text.PlainText
                 text: "\u28BF"  // ⠿ drag handle
                 color: Qt.darker(Color.popups.text, 1.8)
                 font.family: root.iconFont
@@ -1318,6 +1711,7 @@ BarWidget {
                 anchors.verticalCenter: parent.verticalCenter
               }
               Text {
+                textFormat: Text.PlainText
                 id: hdrTitle
                 text: root.tr("title")
                 color: Color.popups.text
@@ -1327,11 +1721,19 @@ BarWidget {
               }
             }
           }
-          // Sort: cycle RAM → CPU → name (bars + arrow reads as "sort").
+          // Click-to-kill a stuck window (Hyprland kill mode).
           IconBtn {
-            glyph: "\uF161"
-            active: root.sortBy !== "ram"
-            onClicked: root.cycleSort()
+            glyph: "\uF05B"
+            hint: root.tr("killClickHint")
+            onClicked: root.killByClick()
+          }
+          // Shell reset; red bolt while SUPER arms the forced reset.
+          IconBtn {
+            id: shellResetBtn
+            glyph: root.forceArmed ? "\uF0E7" : "\uF021"
+            danger: root.forceArmed
+            hint: root.forceArmed ? root.tr("shellResetForceHint") : root.tr("shellResetHint")
+            onClicked: root.shellReset(shellResetBtn.mods)
           }
           // Pin: keep the dialog visible (outside clicks don't close it).
           IconBtn {
@@ -1351,21 +1753,108 @@ BarWidget {
           IconBtn { glyph: "\uDB80\uDD56"; active: false; onClicked: root.closePopup() }
         }
 
-        Text {
+        // Memory at a glance: used share as a bar coloured by how full it
+        // is, then the numbers behind it.
+        ColumnLayout {
           Layout.fillWidth: true
-          text: root.tr("ramFree") + ": " + (root.memAvailMb / 1024).toFixed(1) + " GB / "
-                + (root.memTotalMb / 1024).toFixed(0) + " GB   ·   PSI "
-                + root.psiSome10.toFixed(2) + "   ·   " + root.tr("paused") + ": " + root.frozenCount
-                + (root.swapUsedMb > 50 ? "   ·   SWAP " + (root.swapUsedMb / 1024).toFixed(1) + " GB" : "")
-          color: Qt.darker(Color.popups.text, 1.3)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
+          spacing: Style.space(4)
+          RowLayout {
+            Layout.fillWidth: true
+            spacing: Style.space(8)
+            Text {
+              textFormat: Text.PlainText
+              text: "RAM " + root.memUsedPct + "%"
+              color: root.usageColor(root.memUsedPct)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.body
+              font.bold: true
+            }
+            Text {
+              textFormat: Text.PlainText
+              Layout.fillWidth: true
+              text: root.fmtMem(root.memTotalMb - root.memAvailMb) + " / " + root.fmtMem(root.memTotalMb)
+                    + (root.swapUsedMb > 50 ? "   ·   Swap " + root.fmtMem(root.swapUsedMb) : "")
+                    + "   ·   PSI " + root.psiSome10.toFixed(1)
+              color: Qt.darker(Color.popups.text, 1.3)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+            Pill {
+              visible: root.frozenCount > 0
+              label: root.frozenCount + " " + root.tr("paused")
+            }
+            Pill {
+              visible: root.engineKind === "python"
+              tint: Qt.darker(Color.popups.text, 1.3)
+              label: root.tr("engineLightTag")
+            }
+          }
+          Rectangle {
+            Layout.fillWidth: true
+            height: 6
+            radius: 3
+            color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.12)
+            Rectangle {
+              width: parent.width * Math.max(0, Math.min(100, root.memUsedPct)) / 100
+              height: parent.height
+              radius: 3
+              color: root.usageColor(root.memUsedPct)
+              Behavior on width { NumberAnimation { duration: 250 } }
+            }
+          }
         }
 
         Rectangle {
           Layout.fillWidth: true
           height: 1
           color: Color.popups.border
+        }
+
+        // Engine banner: the full engine was wanted but did not build. The
+        // light engine keeps everything working; say so, with the reason.
+        Rectangle {
+          visible: root.engineState === "failed" && !root.lightChosen && !root.prefsOpen
+          Layout.fillWidth: true
+          height: engineCol.implicitHeight + Style.space(16)
+          color: Qt.rgba(0.95, 0.65, 0.15, 0.12)
+          border.color: Qt.rgba(0.95, 0.65, 0.15, 0.5)
+          border.width: 1
+          radius: Style.cornerRadius - 2
+
+          Column {
+            id: engineCol
+            width: parent.width - Style.space(16)
+            anchors.centerIn: parent
+            spacing: Style.space(4)
+
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              text: root.tr("engineFailed")
+              color: Color.popups.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              visible: root.engineError !== ""
+              text: root.engineError
+              color: Qt.darker(Color.popups.text, 1.5)
+              font.family: root.iconFont
+              font.pixelSize: Style.font.caption - 1
+              wrapMode: Text.WrapAnywhere
+              maximumLineCount: 8
+              elide: Text.ElideRight
+            }
+            Button {
+              iconText: root.tr("engineRetry")
+              bordered: true
+              onClicked: root.buildEngine()
+            }
+          }
         }
 
         // zswap warning banner: compression off = squeezed RAM goes to disk.
@@ -1388,6 +1877,7 @@ BarWidget {
             spacing: Style.space(4)
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: root.zswapAvailable ? root.tr("zswapWarn") : root.tr("zswapNoKernel")
               color: Color.popups.text
@@ -1396,28 +1886,14 @@ BarWidget {
               wrapMode: Text.WordWrap
             }
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               visible: root.zswapAvailable
-              text: "sudo sh -c 'echo Y > /sys/module/zswap/parameters/enabled'"
-              color: Color.accent
-              font.family: root.iconFont
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WrapAnywhere
-            }
-            Text {
-              width: parent.width
-              visible: root.zswapAvailable
-              text: root.tr("zswapPersist")
+              text: root.tr("zswapHow")
               color: Qt.darker(Color.popups.text, 1.5)
-              font.family: root.iconFont
+              font.family: Style.font.family
               font.pixelSize: Style.font.caption - 1
-              wrapMode: Text.WrapAnywhere
-            }
-            Button {
-              visible: root.zswapAvailable
-              iconText: root.tr("copyCmd")
-              bordered: true
-              onClicked: root.copyZswapCmd()
+              wrapMode: Text.WordWrap
             }
           }
         }
@@ -1432,29 +1908,154 @@ BarWidget {
           Layout.fillHeight: true
           spacing: Style.space(8)
 
-          // Shortcut: OPT-IN SUPER+SHIFT+T bind — the helper script writes
-          // the hyprland lua only on this explicit click (marketplace rule:
-          // consent required).
+          // Engine choice: light (Python, nothing to build) or full (Rust,
+          // built locally when cargo is installed).
+          RowLayout {
+            width: parent.width
+            spacing: Style.space(6)
+            Text {
+              textFormat: Text.PlainText
+              Layout.fillWidth: true
+              text: root.tr("engineLabel")
+              color: Color.popups.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+            Chip {
+              label: root.tr("engineLightName")
+              active: !root.engineFull
+              onClicked: root.chooseEngine(true)
+            }
+            Chip {
+              label: root.tr("engineFullName")
+              active: root.engineFull
+              onClicked: root.chooseEngine(false)
+            }
+          }
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            text: root.engineFull ? root.tr("engineFullNote")
+                  : root.lightChosen ? root.tr("engineLightNote")
+                  : root.engineState === "checking" ? root.tr("engineBuilding")
+                  : root.engineState === "nocargo" ? root.tr("engineNoCargo")
+                  : root.tr("engineFailed")
+            color: Qt.darker(Color.popups.text, 1.4)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption - 1
+            wrapMode: Text.WordWrap
+          }
+
+          // Optional Hyprland snippets: the plugin never edits the user's
+          // config. "Copy" puts the line on the clipboard; the user pastes it
+          // into ~/.config/hypr/bindings.lua. Status comes from Hyprland.
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            text: root.tr("prefsSnippetHint")
+            color: Qt.darker(Color.popups.text, 1.5)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption - 1
+            wrapMode: Text.WordWrap
+          }
           RowLayout {
             width: parent.width
             spacing: Style.space(8)
             Text {
+              textFormat: Text.PlainText
               Layout.fillWidth: true
               text: root.tr("prefsKeybind")
               color: Color.popups.text
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
             }
             Text {
+              textFormat: Text.PlainText
               text: "SUPER+SHIFT+T"
               color: root.keybindOn ? Color.accent : Qt.darker(Color.popups.text, 1.5)
               font.family: root.iconFont
               font.pixelSize: Style.font.caption
             }
             Button {
-              iconText: root.keybindOn ? root.tr("prefsOn") : root.tr("prefsOff")
+              iconText: root.keybindOn ? root.tr("remove") : root.tr("apply")
               bordered: true
-              onClicked: root.toggleKeybind()
+              onClicked: root.configure("show", root.keybindOn ? "remove" : "apply")
+            }
+          }
+
+          // Emergency shortcut: forced shell reset, handled by Hyprland so it
+          // works even when this shell is too frozen to click.
+          RowLayout {
+            width: parent.width
+            spacing: Style.space(8)
+            visible: root.launcherPathSafe
+            Text {
+              textFormat: Text.PlainText
+              Layout.fillWidth: true
+              text: root.tr("prefsResetKeybind")
+              color: Color.popups.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            Text {
+              textFormat: Text.PlainText
+              text: "SUPER+CTRL+SHIFT+DEL"
+              color: root.resetKeybindOn ? "#ff6b60" : Qt.darker(Color.popups.text, 1.5)
+              font.family: root.iconFont
+              font.pixelSize: Style.font.caption
+            }
+            Button {
+              iconText: root.resetKeybindOn ? root.tr("remove") : root.tr("apply")
+              bordered: true
+              onClicked: root.configure("reset", root.resetKeybindOn ? "remove" : "apply")
+            }
+          }
+
+          // Veils over paused windows: need the window rule first.
+          RowLayout {
+            width: parent.width
+            spacing: Style.space(8)
+            Text {
+              textFormat: Text.PlainText
+              Layout.fillWidth: true
+              text: root.tr("prefsVeils")
+              color: Color.popups.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            Button {
+              iconText: root.tr("applyRule")
+              bordered: true
+              onClicked: root.configure("veil", "apply")
+            }
+            Button {
+              iconText: root.veilsOn ? root.tr("prefsOn") : root.tr("prefsOff")
+              bordered: true
+              onClicked: root.setPref("veils", !root.veilsOn)
+            }
+          }
+
+          // Watchdog + memory governor (runs inside this shell).
+          RowLayout {
+            width: parent.width
+            spacing: Style.space(8)
+            Text {
+              textFormat: Text.PlainText
+              Layout.fillWidth: true
+              text: root.tr("prefsWatchdog")
+              color: Color.popups.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            Button {
+              iconText: root.pref("watchdog", true) ? root.tr("prefsOn") : root.tr("prefsOff")
+              bordered: true
+              onClicked: root.setPref("watchdog", !root.pref("watchdog", true))
             }
           }
 
@@ -1463,6 +2064,7 @@ BarWidget {
             width: parent.width
             spacing: Style.space(8)
             Text {
+              textFormat: Text.PlainText
               Layout.fillWidth: true
               text: root.tr("prefsBarMode")
               color: Color.popups.text
@@ -1481,6 +2083,7 @@ BarWidget {
             width: parent.width
             spacing: Style.space(8)
             Text {
+              textFormat: Text.PlainText
               Layout.fillWidth: true
               text: root.tr("prefsSpark")
               color: Color.popups.text
@@ -1500,6 +2103,7 @@ BarWidget {
             spacing: Style.space(8)
             property int v: root.pref("watchMaxRam", 94)
             Text {
+              textFormat: Text.PlainText
               Layout.fillWidth: true
               text: root.tr("prefsRam")
               color: Color.popups.text
@@ -1512,6 +2116,7 @@ BarWidget {
               onClicked: if (parent.v > 50) root.setPref("watchMaxRam", parent.v - 1)
             }
             Text {
+              textFormat: Text.PlainText
               text: parent.v + "%"
               color: Color.accent
               font.family: root.iconFont
@@ -1530,6 +2135,7 @@ BarWidget {
             spacing: Style.space(8)
             property int v: root.pref("watchMaxCpu", 0)
             Text {
+              textFormat: Text.PlainText
               Layout.fillWidth: true
               text: root.tr("prefsCpu")
               color: Color.popups.text
@@ -1542,6 +2148,7 @@ BarWidget {
               onClicked: if (parent.v > 0) root.setPref("watchMaxCpu", parent.v <= 55 ? 0 : parent.v - 5)
             }
             Text {
+              textFormat: Text.PlainText
               text: parent.v === 0 ? root.tr("prefsOff") : parent.v + "%"
               color: Color.accent
               font.family: root.iconFont
@@ -1566,6 +2173,7 @@ BarWidget {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             text: root.tr("prefsHint")
             color: Qt.darker(Color.popups.text, 1.5)
@@ -1575,64 +2183,82 @@ BarWidget {
           }
         }
 
-        // Suggestions: evidence-based actions from the helper (sleepers in
-        // swap, discardable background tabs, high pressure).
+        // Suggestions: evidence-based hints from the engine (sleepers in
+        // swap, high pressure). Only the kill action is offered here.
+        // One compact line each, so they never push the list off the card.
+        // "Memory pressure is high" is left out: the RAM bar already says it.
         Repeater {
-          model: root.prefsOpen ? [] : root.suggestions
+          model: root.prefsOpen ? [] : root.suggestions.filter(function(sg) { return sg.kind !== "pressure" }).slice(0, 4)
           Rectangle {
             required property var modelData
-            width: listFlick.width
-            height: sugRow.implicitHeight + Style.space(8)
+            Layout.fillWidth: true
+            height: sugRow.implicitHeight + Style.space(4)
             radius: Style.cornerRadius - 2
             color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.08)
-            border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.25)
-            border.width: 1
             RowLayout {
               id: sugRow
-              width: parent.width - Style.space(16)
+              width: parent.width - Style.space(12)
               anchors.centerIn: parent
               spacing: Style.space(8)
               Text {
+                textFormat: Text.PlainText
                 Layout.fillWidth: true
-                text: "💡 " + modelData.text
-                  + (root.armedCmd !== "" && root.armedCmd === modelData.cmd
-                     ? "  — " + root.tr("clickAgainConfirm") : "")
-                color: Color.popups.text
+                text: "💡 " + root.sugText(modelData)
+                color: Qt.darker(Color.popups.text, 1.15)
                 font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
+                font.pixelSize: Style.font.caption - 1
+                elide: Text.ElideRight
               }
               RowBtn {
                 visible: modelData.action === "kill"
                 glyph: "\uDB80\uDD56"
                 danger: true
-                onClicked: root.action("kill", modelData.pid)
-              }
-              RowBtn {
-                visible: modelData.action === "discard-bg"
-                glyph: "⏏"
-                accent: true
-                onClicked: root.tabDiscardAll()
-              }
-              // Helper subcommand (clean-tmp, zswap-copy): the helper does
-              // the work and notifies; the next poll drops the suggestion.
-              RowBtn {
-                visible: modelData.action === "run"
-                glyph: modelData.cmd === "zswap-copy" ? "\uF0C5" : "\uF1F8"
-                accent: !modelData.confirm || root.armedCmd === modelData.cmd
-                danger: !!modelData.confirm && root.armedCmd === modelData.cmd
-                onClicked: {
-                  if (modelData.confirm && root.armedCmd !== modelData.cmd) {
-                    root.armedCmd = modelData.cmd
-                    armTimer.restart()
-                    return
-                  }
-                  root.armedCmd = ""
-                  root.action(modelData.cmd, 0)
-                }
+                onClicked: root.action("kill", modelData)
               }
             }
           }
+        }
+
+        // Search + quick filters, then the column titles (click to sort).
+        RowLayout {
+          visible: !root.prefsOpen
+          Layout.fillWidth: true
+          spacing: Style.space(6)
+          TextField {
+            id: searchField
+            Layout.fillWidth: true
+            Layout.preferredHeight: 26
+            verticalPadding: 2
+            font.pixelSize: Style.font.caption
+            foreground: Color.popups.text
+            placeholderText: root.tr("searchHint")
+            onTextChanged: root.filterText = text
+            Keys.onEscapePressed: { text = ""; card.forceActiveFocus() }
+            Keys.onReturnPressed: card.forceActiveFocus()
+          }
+          Repeater {
+            model: [["all", root.tr("fAll")], ["paused", root.tr("fPaused")],
+                    ["cpu", "CPU ≥ 5%"], ["ram", "RAM ≥ 500 MB"]]
+            Chip {
+              required property var modelData
+              label: modelData[1]
+              active: root.quickFilter === modelData[0]
+              onClicked: root.quickFilter = modelData[0]
+            }
+          }
+        }
+        RowLayout {
+          visible: !root.prefsOpen
+          Layout.fillWidth: true
+          Layout.leftMargin: Style.space(8)
+          Layout.rightMargin: Style.space(8)
+          spacing: Style.space(8)
+          Item { Layout.preferredWidth: 14 + 20 + Style.space(8); height: 1 }
+          ColHead { key: "name"; alignEnd: false; Layout.fillWidth: true }
+          Item { visible: root.pref("sparklines", false); Layout.preferredWidth: 50; height: 1 }
+          ColHead { key: "cpu"; cellWidth: root.cpuColW }
+          ColHead { key: "ram"; cellWidth: root.ramColW }
+          Item { Layout.preferredWidth: 44 + Style.space(8); height: 1 }
         }
 
         // The list FLEXES: it absorbs leftover card space, so the Activity
@@ -1650,9 +2276,12 @@ BarWidget {
           model: appsModel
 
           header: Text {
+            textFormat: Text.PlainText
             width: listFlick.width
-            visible: root.apps.length === 0
-            text: root.tr("noApps")
+            // An invisible header still takes its height in a ListView.
+            height: visible ? implicitHeight + Style.space(6) : 0
+            visible: root.apps.length === 0 && root.engineReady
+            text: root.filterText !== "" || root.quickFilter !== "all" ? root.tr("noMatch") : root.tr("noApps")
             color: Qt.darker(Color.popups.text, 1.4)
             font.family: Style.font.family
             font.pixelSize: Style.font.body
@@ -1694,6 +2323,7 @@ BarWidget {
                       height: 14
                       Layout.alignment: Qt.AlignVCenter
                       Text {
+                        textFormat: Text.PlainText
                         anchors.centerIn: parent
                         visible: app.procs > 1
                         text: root.expandedProcs[app.pid] ? "\uDB80\uDD40" : "\uDB80\uDD42"
@@ -1709,32 +2339,48 @@ BarWidget {
                       }
                     }
 
+                    AppIcon {
+                      cls: app["class"] || ""
+                      name: app.name || ""
+                      dim: !!app.frozen
+                    }
+
                     // Click the app name/title to focus its window.
                     MouseArea {
                       Layout.fillWidth: true
                       Layout.preferredHeight: nameCol.implicitHeight
                       cursorShape: Qt.PointingHandCursor
-                      onClicked: root.action("focus", app.pid)
+                      onClicked: root.action("focus", app)
 
                       Column {
                         id: nameCol
                         width: parent.width
                         spacing: Style.space(2)
-                        property string cpuPct: root.cpuFor(app.unit, app.pid)
 
-                        Text {
+                        RowLayout {
                           width: parent.width
-                          text: app.name + (nameCol.cpuPct !== "" ? "  ·  " + nameCol.cpuPct : "")
-                                + (app.frozen ? "  ·  " + root.tr("pausedTag") : "")
-                          color: app.frozen ? Qt.darker(Color.popups.text, 1.6) : Color.popups.text
-                          font.family: Style.font.family
-                          font.pixelSize: Style.font.body
-                          font.bold: true
-                          elide: Text.ElideRight
+                          spacing: Style.space(6)
+                          Text {
+                            textFormat: Text.PlainText
+                            Layout.maximumWidth: nameCol.width - (pausedPill.visible ? pausedPill.width + Style.space(6) : 0)
+                            text: app.name || ""
+                            color: app.frozen ? Qt.darker(Color.popups.text, 1.6) : Color.popups.text
+                            font.family: Style.font.family
+                            font.pixelSize: Style.font.body
+                            font.bold: true
+                            elide: Text.ElideRight
+                          }
+                          Pill {
+                            id: pausedPill
+                            visible: !!app.frozen
+                            label: root.tr("pausedTag")
+                          }
+                          Item { Layout.fillWidth: true; height: 1 }
                         }
                         Text {
+                          textFormat: Text.PlainText
                           width: parent.width
-                          text: app.title + "  ·  " + app.rss_mb + " MB"
+                          text: (app.title || "")
                                 + (app.windows > 1 ? "  ·  " + app.windows + " " + root.tr("windows") : "")
                                 + (app.procs > 1 ? "  ·  " + app.procs + " " + root.tr("procs") : "")
                           color: Qt.darker(Color.popups.text, 1.4)
@@ -1761,75 +2407,60 @@ BarWidget {
                         ctx.reset()
                         if (!sd || sd.length === 0) return
                         var bw = width / sd.length
-                        ctx.fillStyle = app.frozen ? Qt.darker(Color.accent, 1.6) : Color.accent
                         for (var i = 0; i < sd.length; i++) {
+                          ctx.fillStyle = root.sparkColor(sd[i], app.frozen)
                           var bh = Math.max(1, sd[i] * height)
                           ctx.fillRect(i * bw, height - bh, Math.max(1, bw - 1), bh)
                         }
                       }
                     }
 
+                    ValueCell {
+                      cellWidth: root.cpuColW
+                      property real v: root.cpuVal(app.unit, app.pid)
+                      text: root.cpuFor(app.unit, app.pid) || "—"
+                      color: app.frozen ? Qt.darker(Color.popups.text, 1.6) : root.cpuColor(v)
+                    }
+                    ValueCell {
+                      cellWidth: root.ramColW
+                      text: root.fmtMem(app.rss_mb || 0)
+                      color: app.frozen ? Qt.darker(Color.popups.text, 1.6) : root.memColor(app.rss_mb || 0)
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                    }
                     RowBtn {
                       glyph: app.frozen ? "\uDB81\uDC0A" : "\uDB80\uDFE4"
                       accent: app.frozen
-                      onClicked: root.action(app.frozen ? "thaw" : "freeze", app.pid)
+                      onClicked: root.action(app.frozen ? "thaw" : "freeze", app)
                     }
                     RowBtn {
                       glyph: "\uDB80\uDD56"
                       danger: true
-                      onClicked: root.action("kill", app.pid)
+                      onClicked: root.action("kill", app)
                     }
                   }
                 }
 
-                // Browser tabs (live, from the companion extension via the
-                // native bridge) — every tab, not just the active one per
-                // window. Falls back to window titles when the bridge is
-                // not installed. app comes from root.apps (raw state array).
+                // Window titles of the expanded app (one row per window).
                 Repeater {
                   model: root.expandedProcs[app.pid]
-                         ? ((app.tabs && app.tabs.length)
-                            ? root.tabGroups(app)
-                            : (app.wins || []).filter(function(w) { return w.title && w.title !== "" }))
+                         ? (app.wins || []).filter(function(w) { return w.title && w.title !== "" }).slice(0, 64)
                          : []
                   Rectangle {
                     required property var modelData
-                    // header rows = window groups; tab objects carry .active;
-                    // bare window objects (fallback) have neither
-                    readonly property bool isHeader: modelData.header === true
-                    readonly property bool isTab: modelData.active !== undefined
-                    readonly property bool canDiscard: isTab && !isHeader
-                        && !modelData.active && !modelData.discarded
                     width: parent.width - Style.space(20)
-                    x: isHeader ? Style.space(20) : Style.space(32)
-                    height: Math.max(tabText.implicitHeight, 16) + (isHeader ? Style.space(4) : Style.space(2))
+                    x: Style.space(32)
+                    height: Math.max(winText.implicitHeight, 16) + Style.space(2)
                     color: "transparent"
                     Text {
-                      id: tabText
-                      width: parent.width - (parent.canDiscard ? Style.space(24) : 0)
-                      text: parent.isHeader ? ("▾ " + parent.modelData.title)
-                            : (parent.isTab
-                               ? ((parent.modelData.active ? "▸ " : "· ")
-                                  + (parent.modelData.title || parent.modelData.url || "")
-                                  + (parent.modelData.audible ? " ♪" : "")
-                                  + (parent.modelData.loading ? " …" : "")
-                                  + (parent.modelData.discarded ? qsTr("  (durmiendo)") : ""))
-                               : "▸ " + parent.modelData.title)
-                      color: parent.isHeader || (parent.isTab && parent.modelData.active)
-                             ? Qt.darker(Color.popups.text, 1.05)
-                             : Qt.darker(Color.popups.text, 1.15)
-                      opacity: parent.isTab && !parent.modelData.active ? 0.75 : 1.0
+                      textFormat: Text.PlainText
+                      id: winText
+                      width: parent.width
+                      text: "▸ " + parent.modelData.title
+                      color: Qt.darker(Color.popups.text, 1.15)
                       font.family: Style.font.family
                       font.pixelSize: Style.font.caption
                       elide: Text.ElideRight
-                    }
-                    RowBtn {
-                      visible: parent.canDiscard
-                      anchors.right: parent.right
-                      anchors.verticalCenter: parent.verticalCenter
-                      scale: 0.75
-                      glyph: "⏏"
-                      onClicked: root.tabDiscard(parent.modelData.id)
                     }
                   }
                 }
@@ -1858,6 +2489,7 @@ BarWidget {
                       spacing: Style.space(8)
 
                       Text {
+                        textFormat: Text.PlainText
                         Layout.fillWidth: true
                         // Role beats comm: chromium/electron children all
                         // share the parent's comm, the role is the real info
@@ -1869,6 +2501,7 @@ BarWidget {
                         elide: Text.ElideRight
                       }
                       Text {
+                        textFormat: Text.PlainText
                         text: proc.state
                         color: proc.state === "T" ? Color.accent
                                : (proc.state === "Z" ? "#ff3b30"
@@ -1879,6 +2512,7 @@ BarWidget {
                         font.bold: proc.state === "T" || proc.state === "Z" || proc.state === "R"
                       }
                       Text {
+                        textFormat: Text.PlainText
                         text: proc.rss_mb + " MB"
                         color: Qt.darker(Color.popups.text, 1.5)
                         font.family: Style.font.family
@@ -1889,12 +2523,12 @@ BarWidget {
                       RowBtn {
                         glyph: proc.state === "T" ? "\uDB81\uDC0A" : "\uDB80\uDFE4"
                         accent: proc.state === "T"
-                        onClicked: root.action(proc.state === "T" ? "thaw-pid" : "freeze-pid", proc.pid)
+                        onClicked: root.action(proc.state === "T" ? "thaw-pid" : "freeze-pid", proc)
                       }
                       RowBtn {
                         glyph: "\uDB80\uDD56"
                         danger: true
-                        onClicked: root.action("kill-pid", proc.pid)
+                        onClicked: root.action("kill-pid", proc)
                       }
                     }
                   }
@@ -1906,8 +2540,9 @@ BarWidget {
 
             // --- background processes (no window), grouped by comm ---
             Text {
+              textFormat: Text.PlainText
               visible: root.background.length > 0
-              text: root.tr("background")
+              text: root.tr("background") + "  ·  " + root.background.length
               color: Qt.darker(Color.popups.text, 1.4)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
@@ -1938,35 +2573,89 @@ BarWidget {
 
                   // Fixed slot matching the windowed rows' expander column.
                   Item { width: 14; height: 1 }
-
-                  Text {
-                    Layout.fillWidth: true
-                    property string cpuPct: root.cpuFor(bg.unit, bg.pid)
-                    text: bg.name + (cpuPct !== "" ? "  ·  " + cpuPct : "")
-                          + (bg.frozen ? "  ·  " + root.tr("pausedTag") : "")
-                    color: bg.frozen ? Qt.darker(Color.popups.text, 1.6) : Color.popups.text
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.caption
-                    elide: Text.ElideRight
+                  AppIcon {
+                    name: bg.name || ""
+                    dim: !!bg.frozen
                   }
-                  Text {
-                    text: (bg.procs > 1 ? bg.procs + " " + root.tr("procs") + " · " : "")
-                          + bg.rss_mb + " MB"
-                          + (bg.swap_mb > 0 ? "  ·  ⤓ " + bg.swap_mb + " MB" : "")
-                    color: Qt.darker(Color.popups.text, 1.4)
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.caption
+                  Column {
+                    id: bgNameCol
+                    Layout.fillWidth: true
+                    spacing: 0
+                    RowLayout {
+                      width: parent.width
+                      spacing: Style.space(6)
+                      Text {
+                        textFormat: Text.PlainText
+                        Layout.maximumWidth: bgNameCol.width - (bgPill.visible ? bgPill.width + Style.space(6) : 0)
+                        text: bg.name || ""
+                        color: bg.frozen ? Qt.darker(Color.popups.text, 1.6) : Color.popups.text
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                        elide: Text.ElideRight
+                      }
+                      Pill {
+                        id: bgPill
+                        visible: !!bg.frozen
+                        label: root.tr("pausedTag")
+                      }
+                      Item { Layout.fillWidth: true; height: 1 }
+                    }
+                    Text {
+                      textFormat: Text.PlainText
+                      width: parent.width
+                      visible: text !== ""
+                      text: (bg.procs > 1 ? bg.procs + " " + root.tr("procs") : "")
+                            + (bg.procs > 1 && bg.swap_mb > 0 ? "  ·  " : "")
+                            + (bg.swap_mb > 0 ? "swap " + root.fmtMem(bg.swap_mb) : "")
+                      color: Qt.darker(Color.popups.text, 1.5)
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption - 1
+                      elide: Text.ElideRight
+                    }
+                  }
+                  // Same sparkline as the windowed rows.
+                  Canvas {
+                    width: 50
+                    height: 14
+                    visible: root.pref("sparklines", false)
+                    Layout.alignment: Qt.AlignVCenter
+                    property var sd: root.sparkFor(bg.hkey, bg.pid, 24)
+                    onSdChanged: requestPaint()
+                    onPaint: {
+                      var ctx = getContext("2d")
+                      ctx.reset()
+                      if (!sd || sd.length === 0) return
+                      var bw = width / sd.length
+                      for (var i = 0; i < sd.length; i++) {
+                        ctx.fillStyle = root.sparkColor(sd[i], bg.frozen)
+                        var bh = Math.max(1, sd[i] * height)
+                        ctx.fillRect(i * bw, height - bh, Math.max(1, bw - 1), bh)
+                      }
+                    }
+                  }
+                  ValueCell {
+                    cellWidth: root.cpuColW
+                    property real v: root.cpuVal(bg.hkey, bg.pid)
+                    text: root.cpuFor(bg.hkey, bg.pid) || "—"
+                    color: bg.frozen ? Qt.darker(Color.popups.text, 1.6) : root.cpuColor(v)
+                  }
+                  ValueCell {
+                    cellWidth: root.ramColW
+                    text: root.fmtMem(bg.rss_mb || 0)
+                    color: bg.frozen ? Qt.darker(Color.popups.text, 1.6) : root.memColor(bg.rss_mb || 0)
+                    font.bold: true
                   }
                   // Pause (scope or signal fallback) + kill, on every row.
                   RowBtn {
                     glyph: bg.frozen ? "\uDB81\uDC0A" : "\uDB80\uDFE4"
                     accent: bg.frozen
-                    onClicked: root.action(bg.frozen ? "thaw" : "freeze", bg.pid)
+                    onClicked: root.action(bg.frozen ? "thaw" : "freeze", bg)
                   }
                   RowBtn {
                     glyph: "\uDB80\uDD56"
                     danger: true
-                    onClicked: root.action("kill", bg.pid)
+                    onClicked: root.action("kill", bg)
                   }
                 }
               }
@@ -1976,8 +2665,9 @@ BarWidget {
             // machine feels slow. Informational only — we cannot signal
             // foreign pids, so these rows carry no buttons. ---
             Text {
+              textFormat: Text.PlainText
               visible: root.system.length > 0
-              text: root.tr("system")
+              text: root.tr("system") + "  ·  " + root.system.length
               color: Qt.darker(Color.popups.text, 1.4)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
@@ -2002,21 +2692,51 @@ BarWidget {
                   spacing: Style.space(8)
 
                   Item { width: 14; height: 1 }
+                  AppIcon {
+                    name: sys.name || ""
+                    dim: true
+                  }
                   Text {
+                    textFormat: Text.PlainText
                     Layout.fillWidth: true
-                    text: sys.name
+                    text: (sys.name || "") + (sys.procs > 1 ? "  ·  " + sys.procs + " " + root.tr("procs") : "")
                     color: Qt.darker(Color.popups.text, 1.6)
                     font.family: Style.font.family
                     font.pixelSize: Style.font.caption
                     elide: Text.ElideRight
                   }
-                  Text {
-                    text: (sys.procs > 1 ? sys.procs + " " + root.tr("procs") + " · " : "")
-                          + sys.rss_mb + " MB"
-                    color: Qt.darker(Color.popups.text, 1.6)
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.caption
+                  // Muted sparkline + CPU%: informational, like the row.
+                  Canvas {
+                    width: 50
+                    height: 14
+                    visible: root.pref("sparklines", false)
+                    Layout.alignment: Qt.AlignVCenter
+                    property var sd: root.sparkFor(sys.hkey, sys.pid, 24)
+                    onSdChanged: requestPaint()
+                    onPaint: {
+                      var ctx = getContext("2d")
+                      ctx.reset()
+                      if (!sd || sd.length === 0) return
+                      var bw = width / sd.length
+                      for (var i = 0; i < sd.length; i++) {
+                        ctx.fillStyle = root.sparkColor(sd[i], true)
+                        var bh = Math.max(1, sd[i] * height)
+                        ctx.fillRect(i * bw, height - bh, Math.max(1, bw - 1), bh)
+                      }
+                    }
                   }
+                  ValueCell {
+                    cellWidth: root.cpuColW
+                    text: root.cpuFor(sys.hkey, sys.pid) || "—"
+                    color: Qt.darker(Color.popups.text, 1.6)
+                  }
+                  ValueCell {
+                    cellWidth: root.ramColW
+                    text: root.fmtMem(sys.rss_mb || 0)
+                    color: Qt.darker(Color.popups.text, 1.6)
+                  }
+                  // Same width as the action buttons of the rows above.
+                  Item { Layout.preferredWidth: 44 + Style.space(8); height: 1 }
                 }
               }
             }
@@ -2034,6 +2754,7 @@ BarWidget {
             width: parent.width
             spacing: Style.space(8)
             Text {
+              textFormat: Text.PlainText
               text: root.tr("activity") + "   ·   CPU " + root.cpuNow.toFixed(0)
                     + "%   ·   RAM " + root.memNow.toFixed(0) + "%"
               color: Qt.darker(Color.popups.text, 1.3)
@@ -2063,6 +2784,7 @@ BarWidget {
             accentColor: Color.accent
           }
           Text {
+            textFormat: Text.PlainText
             visible: root.pref("graphDetail", false)
             text: root.tr("cores")
             color: Qt.darker(Color.popups.text, 1.6)
@@ -2101,6 +2823,7 @@ BarWidget {
         // Keyboard shortcut legend — always pinned to the card bottom so
         // users discover the navigation keys.
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: root.tr("keysHint")
           color: Qt.darker(Color.popups.text, 1.7)
@@ -2120,6 +2843,7 @@ BarWidget {
         anchors.bottom: parent.bottom
         anchors.margins: 2
         Text {
+          textFormat: Text.PlainText
           anchors.centerIn: parent
           text: "◢"
           color: resizeMa.containsMouse ? Color.popups.text : Qt.darker(Color.popups.text, 1.8)
@@ -2170,6 +2894,7 @@ BarWidget {
       anchors.centerIn: parent
       spacing: 4
       Text {
+        textFormat: Text.PlainText
         text: "\uF0AE"
         color: root.frozenCount > 0 ? Color.accent : Color.foreground
         font.family: root.faFont
@@ -2178,6 +2903,7 @@ BarWidget {
       }
       // CPU: microchip + fixed-width % + its OWN sparkline (graph mode).
       Text {
+        textFormat: Text.PlainText
         visible: root.barMode !== "off"
         text: "\uF2DB " + ("   " + root.cpuNow.toFixed(0)).slice(-3) + "%"
         color: Qt.darker(Color.foreground, 1.3)
@@ -2217,6 +2943,7 @@ BarWidget {
       }
       // RAM: cubes (blocks) + fixed-width % + its OWN sparkline (graph mode).
       Text {
+        textFormat: Text.PlainText
         visible: root.barMode !== "off"
         text: "\uF1B3 " + ("   " + root.memNow.toFixed(0)).slice(-3) + "%"
         color: Qt.darker(Color.foreground, 1.3)
@@ -2263,6 +2990,7 @@ BarWidget {
       width: 14; height: 14; radius: 7
       color: "#ff3b30"
       Text {
+        textFormat: Text.PlainText
         anchors.centerIn: parent
         text: root.frozenCount > 9 ? "9+" : String(root.frozenCount)
         color: "#ffffff"
@@ -2284,5 +3012,9 @@ BarWidget {
     }
   }
 
-  Component.onCompleted: root.refresh()
+  Component.onCompleted: {
+    root.veilOwner = Shared.register(root)
+    Quickshell.execDetached([root.lightPath, "popup", "0"])
+    root.refresh()
+  }
 }

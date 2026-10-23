@@ -106,6 +106,7 @@ Item {
   // left (second half of the morph), growing from the eye midpoint. A Text
   // glyph (not a Shape path) — fonts rasterize crisply at any scale.
   Text {
+    textFormat: Text.PlainText
     text: "\u25B6"
     color: mascot.tint
     font.pixelSize: Math.max(1, mascot.width * 0.36)
