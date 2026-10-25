@@ -1038,9 +1038,11 @@ def freeze_family(pid):
     c = comm(pid)
     family = comm_family(pid)
     scopes = family_scopes(family)
+    stopped_pids, stopped_scopes = [], []
     for cgpath, _ in scopes:
         if cg_write(cgpath, "cgroup.freeze", "1"):
             marker_add_scope(cgpath)
+            stopped_scopes.append(cgpath)
         cur = mem_current(cgpath)
         if cur > 0:
             cg_write(cgpath, "memory.high", str(min(max(cur // 4, SQUEEZE_MIN), SQUEEZE_MAX)))
@@ -1048,6 +1050,10 @@ def freeze_family(pid):
     for p in family:
         if p not in scoped and signal_member(p, c, signal.SIGSTOP):
             marker_add(p)
+            st = start_time(p)
+            if st is not None:
+                stopped_pids.append((p, st))
+    return stopped_pids, stopped_scopes
 
 
 def thaw_family(pid):
@@ -1657,14 +1663,64 @@ def notify_text(name, mb):
     lang = os.environ.get("LANGUAGE") or os.environ.get("LANG") or "en"
     if lang.replace(":", ".").replace("_", ".").split(".")[0] == "es":
         return ("%s pausada automáticamente (%d MB)" % (name, mb),
-                "Presión de memoria — reanúdala desde el Administrador de tareas.")
+                "Se reanudará automáticamente cuando los recursos estén estables; también puedes reanudarla desde el Administrador de tareas.")
     return ("%s auto-paused (%d MB)" % (name, mb),
-            "Memory pressure — resume it from the Task Manager.")
+            "It will resume automatically once resources are stable; you can also resume it from the Task Manager.")
+
+
+class Recovery:
+    """One app per ten continuously healthy seconds, using monotonic time."""
+    def __init__(self):
+        self.since = None
+
+    def ready(self, now, healthy):
+        if not healthy:
+            self.since = None
+            return False
+        if self.since is None:
+            self.since = now
+        if now - self.since < 10.0:
+            return False
+        self.since = now
+        return True
+
+
+def recovery_healthy(total, pct, some, full, cpu, cpu_max, crit_avail, recover):
+    return (total > 0 and pct > max(recover, crit_avail * 1.5)
+            and some < 10.0 and full < 1.0
+            and (cpu_max <= 0 or cpu < max(cpu_max - 10.0, 0.0)))
+
+
+class AutoPause:
+    def __init__(self, name, mb, before, after):
+        self.name, self.mb = name, mb
+        self.pids = [p for p in after[0] if p not in before[0]]
+        self.scopes = [s for s in after[1] if s not in before[1]]
+
+    def prune(self):
+        pids, scopes = marker_read()
+        self.pids = [p for p in self.pids if p in pids and start_time(p[0]) == p[1]
+                     and pid_stopped(p[0])]
+        self.scopes = [s for s in self.scopes if s in scopes and scope_frozen(s)]
+        return bool(self.pids or self.scopes)
+
+    def resume(self):
+        # Only the exact stops this watchdog owns, never the whole comm family.
+        for s in list(self.scopes):
+            if cg_write(s, "memory.high", "max") and cg_write(s, "cgroup.freeze", "0"):
+                marker_remove_scope(s)
+                self.scopes.remove(s)
+        for p, st in list(self.pids):
+            if signal_pid(p, st, signal.SIGCONT):
+                marker_remove(p)
+                self.pids.remove((p, st))
+        return not (self.pids or self.scopes)
 
 
 def freeze_biggest(skip):
     by_pid = windows_by_pid(monitors())
     marks = marker_pids()
+    marked_scopes = marker_read()[1]
     focus = focused_pid()
     fcg = proc_cgroup(focus) if focus else None
     focus_unit = fcg[1] if fcg else None
@@ -1685,18 +1741,27 @@ def freeze_biggest(skip):
             continue
         family = comm_family(pid)
         scopes = family_scopes(family)
-        frozen = bool(scopes) and all(scope_frozen(cg) for cg, _ in scopes)
+        frozen = (any(p in marks or pid_stopped(p) for p in family)
+                  or any(scope_frozen(cg) or cg in marked_scopes for cg, _ in scopes))
         consider(pid, c, sum(rss_kb(p) for p in family), scopes[0][1] if scopes else "", frozen)
     for bg in collect_background(by_pid, marks):
         if bg["mechanism"] == "scope":
-            consider(bg["pid"], bg["name"], bg["rss_mb"] * 1024, "", bg["frozen"])
+            family = comm_family(bg["pid"])
+            paused = (bg["frozen"] or any(p in marks or pid_stopped(p) for p in family)
+                      or any(scope_frozen(cg) or cg in marked_scopes
+                             for cg, _ in family_scopes(family)))
+            consider(bg["pid"], bg["name"], bg["rss_mb"] * 1024, "", paused)
     if not best:
         return None
     pid, name, mb = best
-    freeze_family(pid)
+    before = marker_read()
+    stopped = freeze_family(pid)
+    paused = AutoPause(name, mb, before, stopped)
+    if not (paused.pids or paused.scopes):
+        return None
     title, body = notify_text(name, mb)
     notify(cap_str(title), body)
-    return name, mb
+    return paused
 
 
 class Hist:
@@ -1866,6 +1931,8 @@ def cmd_watch(lifeline):
     hits = frozen_episode = tick = 0
     no_candidates = False
     last_frozen = {}
+    auto_paused = []
+    recovery = Recovery()
     hist, prev, prev_apps = Hist(), [cpu_times()], {}
     prev_cpu = cpu_times()
     crit_avail = cpu_max = 0.0
@@ -1883,6 +1950,7 @@ def cmd_watch(lifeline):
         # below stays a last resort.
         if tick % 4 == 0:
             gov.tick(pct, some)
+        cpu_now = 0.0
         if cpu_max > 0:
             cur = cpu_times()
             cpu_now = (cur[0] - prev_cpu[0]) * 100.0 / max(cur[1] - prev_cpu[1], 1)
@@ -1894,6 +1962,16 @@ def cmd_watch(lifeline):
             hits, no_candidates = 0, False
             if pct > _env_num("TM_RECOVER_AVAIL_PCT", 12.0):
                 frozen_episode = 0
+        auto_paused = [p for p in auto_paused if p.prune()]
+        healthy = recovery_healthy(total, pct, some, full, cpu_now, cpu_max,
+                                   crit_avail, _env_num("TM_RECOVER_AVAIL_PCT", 12.0))
+        if recovery.ready(time.monotonic(), healthy and bool(auto_paused)):
+            paused = auto_paused[0]
+            # Even a partial resume must remain freezable in an emergency.
+            last_frozen.pop(paused.name, None)
+            if paused.resume():
+                auto_paused.pop(0)
+                sys.stderr.write("watch: resources stable — resumed %s\n" % paused.name)
         if hits >= 10 and frozen_episode < _env_num("TM_MAX_FREEZE", 3) and not no_candidates:
             now = time.monotonic()
             skip = {n for n, t in last_frozen.items() if now - t < 600}
@@ -1901,8 +1979,9 @@ def cmd_watch(lifeline):
             hits = 0
             if got:
                 sys.stderr.write("watch: pressure critical (%.1f%% avail, psi_full %.1f) — froze %s (%d MB)\n"
-                                 % (pct, full, got[0], got[1]))
-                last_frozen[got[0]] = now
+                                 % (pct, full, got.name, got.mb))
+                last_frozen[got.name] = now
+                auto_paused.append(got)
                 frozen_episode += 1
                 tick += 1
                 nap(2.0)

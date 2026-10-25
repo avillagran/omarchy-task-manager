@@ -124,6 +124,21 @@ exactly 0 CPU. RAM reclaim is the kernel's own machinery (`memory.high`
 plus compressed swap), and thaw restores everything in place. Kill always
 thaws first: frozen processes can't handle SIGTERM.
 
+Apps paused automatically by the watchdog resume automatically, one at a
+time, after **10 continuous seconds** of healthy resources. Available RAM
+must exceed both the recovery margin (12% by default) and 1.5 times the
+critical margin, with memory PSI `some < 10` and `full < 1`. If the CPU
+watchdog is enabled, CPU use must also fall 10 percentage points below its
+limit. Any relapse restarts the wait; each resumed app gets another
+10 seconds of observation before the next app resumes.
+
+Only stops recorded by the current watchdog are eligible; existing manual
+pauses remain paused. A manual resume or an exited process is removed from
+the recovery queue. After automatic resume, the app can be paused again if
+critical pressure returns for the usual 5 seconds (its old 10-minute
+freeze cooldown is cleared). Both engines use the same policy. You can
+still resume an app immediately from the card.
+
 ## Optional extras (in the gear panel, always asked first)
 
 Nothing is written to your Hyprland config behind your back. **Apply** in

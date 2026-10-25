@@ -1194,7 +1194,8 @@ fn verify(t: Target) -> u64 {
 }
 
 /// Freeze an app family (cgroup freezer per scope, signals outside scopes).
-fn freeze_family(pid: u64) {
+fn freeze_family(pid: u64) -> Marker {
+    let mut stopped = Marker { pids: Vec::new(), scopes: Vec::new() };
     let c = comm(pid);
     let family = comm_family(pid);
     let scopes = family_scopes(&family);
@@ -1203,13 +1204,17 @@ fn freeze_family(pid: u64) {
         for p in &family {
             if signal_member(*p, &c, sys::SIGSTOP) {
                 marker_add(*p);
+                if let Some(st) = start_time(*p) {
+                    stopped.pids.push((*p, st));
+                }
             }
         }
-        return;
+        return stopped;
     }
     for (cgpath, _) in &scopes {
         if cg_write(cgpath, "cgroup.freeze", "1") {
             marker_add_scope(cgpath);
+            stopped.scopes.push(cgpath.clone());
         }
         // Squeeze: let the kernel reclaim the frozen app's cold pages.
         let cur = mem_current(cgpath);
@@ -1223,8 +1228,12 @@ fn freeze_family(pid: u64) {
     for p in &family {
         if !scoped.contains(p) && signal_member(*p, &c, sys::SIGSTOP) {
             marker_add(*p);
+            if let Some(st) = start_time(*p) {
+                stopped.pids.push((*p, st));
+            }
         }
     }
+    stopped
 }
 
 fn thaw_family(pid: u64) {
@@ -1704,16 +1713,83 @@ fn focused_pid() -> Option<u64> {
     hypr::query("activewindow")?.get("pid")?.as_u64()
 }
 
-/// Biggest freezable candidate: windowed app or background scope, never the
-/// focused app, never already-frozen, never in `skip` (per-app cooldown),
-/// >= MIN_FREEZE_MB.
-fn freeze_biggest(skip: &std::collections::BTreeSet<String>) -> Option<String> {
+/// Wait for sustained recovery, and space out resumes to observe their impact.
+#[derive(Default)]
+struct Recovery {
+    since: Option<std::time::Instant>,
+}
+
+impl Recovery {
+    fn ready(&mut self, now: std::time::Instant, healthy: bool) -> bool {
+        if !healthy {
+            self.since = None;
+            return false;
+        }
+        let since = self.since.get_or_insert(now);
+        if now.duration_since(*since) < std::time::Duration::from_secs(10) {
+            return false;
+        }
+        self.since = Some(now);
+        true
+    }
+}
+
+fn recovery_healthy(
+    total: u64, pct: f64, some: f64, full: f64,
+    cpu: f32, cpu_max: f64, crit_avail: f64, recover: f64,
+) -> bool {
+    total > 0 && pct > recover.max(crit_avail * 1.5)
+        && some < 10.0 && full < 1.0
+        && (cpu_max <= 0.0 || (cpu as f64) < (cpu_max - 10.0).max(0.0))
+}
+
+struct AutoPause {
+    name: String,
+    mb: u64,
+    owned: Marker,
+}
+
+impl AutoPause {
+    fn prune(&mut self) -> bool {
+        let m = marker_read();
+        self.owned.pids.retain(|(p, st)| {
+            m.pids.contains(&(*p, *st)) && start_time(*p) == Some(*st) && pid_stopped(*p)
+        });
+        self.owned.scopes.retain(|s| m.scopes.contains(s) && scope_frozen(s));
+        !self.owned.pids.is_empty() || !self.owned.scopes.is_empty()
+    }
+
+    fn resume(&mut self) -> bool {
+        // Resume only the exact stops we recorded, not the whole comm family.
+        self.owned.scopes.retain(|s| {
+            if cg_write(s, "memory.high", "max") && cg_write(s, "cgroup.freeze", "0") {
+                marker_remove_scope(s);
+                false
+            } else {
+                true
+            }
+        });
+        self.owned.pids.retain(|(p, st)| {
+            if signal(*p, Some(*st), sys::SIGCONT) {
+                marker_remove(*p);
+                false
+            } else {
+                true
+            }
+        });
+        self.owned.pids.is_empty() && self.owned.scopes.is_empty()
+    }
+}
+
+/// Biggest candidate, excluding focused, stopped and cooling-down apps.
+fn freeze_biggest(skip: &std::collections::BTreeSet<String>) -> Option<AutoPause> {
     let mons = monitors();
     let mut by_pid: BTreeMap<u64, Vec<Win>> = BTreeMap::new();
     for w in clients(&mons) {
         by_pid.entry(w.pid).or_default().push(w);
     }
     let marks = marker_pids();
+    let marked_scopes = marker_read().scopes;
     let focus = focused_pid();
     let focus_unit = focus.and_then(|p| proc_cgroup(p).map(|(_, u)| u));
 
@@ -1745,19 +1821,32 @@ fn freeze_biggest(skip: &std::collections::BTreeSet<String>) -> Option<String> {
         let family = comm_family(*pid);
         let scopes = family_scopes(&family);
         let total: u64 = family.iter().map(|p| rss_kb(*p)).sum();
-        let frozen = !scopes.is_empty() && scopes.iter().all(|(cg, _)| scope_frozen(cg));
+        let frozen = family.iter().any(|p| marks.contains(p) || pid_stopped(*p))
+            || scopes.iter().any(|(cg, _)| scope_frozen(cg) || marked_scopes.contains(cg));
         let unit = scopes.first().map(|(_, u)| u.clone()).unwrap_or_default();
         consider(*pid, c, total, unit, frozen);
     }
     for bg in collect_background(&by_pid, &marks) {
         // Auto-freeze only via scope (atomic, reversible) — no signal stops.
         if bg.mechanism == "scope" {
-            consider(bg.pid, bg.name, bg.rss_mb * 1024, String::new(), bg.frozen);
+            let family = comm_family(bg.pid);
+            let paused = bg.frozen
+                || family.iter().any(|p| marks.contains(p) || pid_stopped(*p))
+                || family_scopes(&family).iter().any(|(cg, _)| {
+                    scope_frozen(cg) || marked_scopes.contains(cg)
+                });
+            consider(bg.pid, bg.name, bg.rss_mb * 1024, String::new(), paused);
         }
     }
 
     let (pid, name, mb) = best?;
-    freeze_family(pid);
+    let before = marker_read();
+    let mut owned = freeze_family(pid);
+    owned.pids.retain(|p| !before.pids.contains(p));
+    owned.scopes.retain(|s| !before.scopes.contains(s));
+    if owned.pids.is_empty() && owned.scopes.is_empty() {
+        return None;
+    }
     // The user must KNOW an app was auto-paused, or it looks like a crash.
     let (title, body) = notify_autopause_text(&name, mb);
     spawn_bounded(
@@ -1772,7 +1861,7 @@ fn freeze_biggest(skip: &std::collections::BTreeSet<String>) -> Option<String> {
         ],
         10,
     );
-    Some(format!("{name} ({mb} MB)"))
+    Some(AutoPause { name, mb, owned })
 }
 
 /// Localized auto-pause notification text (daemon has no i18n.json access).
@@ -1786,11 +1875,11 @@ fn notify_autopause_text(name: &str, mb: u64) -> (String, String) {
     match lang {
         "es" => (
             format!("{name} pausada automáticamente ({mb} MB)"),
-            "Presión de memoria — reanúdala desde el Administrador de tareas.".to_string(),
+            "Se reanudará automáticamente cuando los recursos estén estables; también puedes reanudarla desde el Administrador de tareas.".to_string(),
         ),
         _ => (
             format!("{name} auto-paused ({mb} MB)"),
-            "Memory pressure — resume it from the Task Manager.".to_string(),
+            "It will resume automatically once resources are stable; you can also resume it from the Task Manager.".to_string(),
         ),
     }
 }
@@ -1990,6 +2079,8 @@ fn cmd_watch(lifeline: bool) {
     // re-freezing the user's browser every pressure blip reads as "Chrome
     // keeps hanging".
     let mut last_frozen: BTreeMap<String, std::time::Instant> = BTreeMap::new();
+    let mut auto_paused: Vec<AutoPause> = Vec::new();
+    let mut recovery = Recovery::default();
     let mut no_candidates_since: Option<std::time::Instant> = None;
     let mut gov = governor::Governor::new();
     let mut tick = 0u32;
@@ -2027,6 +2118,17 @@ fn cmd_watch(lifeline: bool) {
                 frozen_this_episode = 0;
             }
         }
+        auto_paused.retain_mut(AutoPause::prune);
+        let healthy = recovery_healthy(total, pct, psi_some, psi_full, cpu_now, cpu_max,
+                                       crit_avail_pct(), recover_avail_pct());
+        if recovery.ready(std::time::Instant::now(), healthy && !auto_paused.is_empty()) {
+            // Even a partially resumed app must remain freezable in an emergency.
+            last_frozen.remove(&auto_paused[0].name);
+            if auto_paused[0].resume() {
+                let paused = auto_paused.remove(0);
+                eprintln!("watch: resources stable — resumed {}", paused.name);
+            }
+        }
         // Sustained pressure only: 10 ticks × 500ms = 5s. Zram reclaim bursts
         // spike psi for 1-3s routinely; those must not freeze anything.
         if hits >= 10
@@ -2041,12 +2143,12 @@ fn cmd_watch(lifeline: bool) {
                 .map(|(n, _)| n.clone())
                 .collect();
             match freeze_biggest(&skip) {
-                Some(what) => {
+                Some(paused) => {
                     eprintln!(
-                        "watch: pressure critical ({pct:.1}% avail, psi_some {psi_some:.1}, psi_full {psi_full:.1}, cpu {cpu_now:.0}%/{cpu_max:.0}) — froze {what}"
+                        "watch: pressure critical ({pct:.1}% avail, psi_some {psi_some:.1}, psi_full {psi_full:.1}, cpu {cpu_now:.0}%/{cpu_max:.0}) — froze {} ({} MB)", paused.name, paused.mb
                     );
-                    let name = what.split(" (").next().unwrap_or(&what).to_string();
-                    last_frozen.insert(name, std::time::Instant::now());
+                    last_frozen.insert(paused.name.clone(), std::time::Instant::now());
+                    auto_paused.push(paused);
                     frozen_this_episode += 1;
                     hits = 0;
                     tick += 1;
@@ -2224,6 +2326,37 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{freeze_critical, parse_starttime, parse_target, pref_value, Target};
+
+    #[test]
+    fn recovery_waits_restarts_and_spaces_apps() {
+        let mut r = super::Recovery::default();
+        let now = std::time::Instant::now();
+        let at = |secs| now + std::time::Duration::from_secs(secs);
+        assert!(!r.ready(at(0), true));
+        assert!(!r.ready(at(9), true));
+        assert!(!r.ready(at(10), false));
+        assert!(!r.ready(at(11), true));
+        assert!(!r.ready(at(20), true));
+        assert!(r.ready(at(21), true));
+        assert!(!r.ready(at(22), true));
+        assert!(r.ready(at(31), true));
+        assert!(!r.ready(at(32), false));
+    }
+
+    #[test]
+    fn recovery_requires_memory_psi_and_cpu_headroom() {
+        let healthy = |total, pct, some, full, cpu, cpu_max, crit| {
+            super::recovery_healthy(total, pct, some, full, cpu, cpu_max, crit, 12.0)
+        };
+        assert!(healthy(16000, 30.0, 0.0, 0.0, 50.0, 90.0, 6.0));
+        assert!(!healthy(0, 30.0, 0.0, 0.0, 50.0, 90.0, 6.0));
+        assert!(!healthy(16000, 12.0, 0.0, 0.0, 50.0, 90.0, 6.0));
+        assert!(!healthy(16000, 30.0, 10.0, 0.0, 50.0, 90.0, 6.0));
+        assert!(!healthy(16000, 30.0, 0.0, 1.0, 50.0, 90.0, 6.0));
+        assert!(!healthy(16000, 30.0, 0.0, 0.0, 80.0, 90.0, 6.0));
+        assert!(!healthy(16000, 30.0, 0.0, 0.0, 50.0, 90.0, 21.0));
+        assert!(healthy(16000, 30.0, 0.0, 0.0, 100.0, 0.0, 6.0));
+    }
 
     #[test]
     fn targets() {
