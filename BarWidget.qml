@@ -1,6 +1,6 @@
 // Omarchy Task Manager: freeze/resume memory-hogging apps.
 // - Pill: tasks glyph + red badge (or live CPU/MEM stats, eye toggle).
-// - Popup: draggable Overlay-layer card above all windows, all workspaces.
+// - Popup: native movable window, including across monitors.
 // - Frozen apps get a grey veil exactly over their windows.
 // - Process tree per app, per-row sparklines, historical CPU/RAM graph.
 import QtQuick 6.11
@@ -951,21 +951,7 @@ BarWidget {
     root.writePopupState(false)
   }
 
-  // The layer surface configures async: width/height are 0 on the first
-  // frames. Center EVENT-DRIVEN from size changes (polling retries lose the
-  // race at shell startup under load, parking the card at (0,0) under the bar).
-  function maybeCenterCard() {
-    if (!root.popupOpen || root.cardPosSet) return
-    if (popupWin.width > card.width && popupWin.height > card.height) {
-      card.x = Math.max(0, (popupWin.width - card.width) / 2)
-      card.y = Math.max(0, (popupWin.height - card.height) / 2)
-      root.cardPosSet = true
-    }
-  }
-
-  function centerCard() {
-    root.maybeCenterCard()
-  }
+  function centerCard() { root.cardPosSet = true }
 
   onPopupOpenChanged: {
     if (root.popupOpen) {
@@ -1579,6 +1565,7 @@ BarWidget {
             for (var j = 0; j < Quickshell.screens.length; j++) {
               if (Quickshell.screens[j].name === mon.name) {
                 root.popupScreen = Quickshell.screens[j]
+                popupWin.screen = root.popupScreen
                 // Card position is relative to the popup window: a position
                 // dragged on one monitor is off-center (or off-screen) on
                 // another — re-center when the target screen changes.
@@ -1605,30 +1592,63 @@ BarWidget {
     return Quickshell.screens.length > 0 ? Quickshell.screens[0] : null
   }
 
-  // --- popup: Overlay layer, above everything, visible on all workspaces ---
-  PanelWindow {
+  // Native toplevel: the compositor owns moving/resizing across outputs.
+  FloatingWindow {
     id: popupWin
+    title: "Omarchy Task Manager"
     visible: root.popupOpen && root.veilOwner
-    screen: root.popupScreen ? root.popupScreen : root.focusedScreen()
-    anchors { top: true; left: true; right: true; bottom: true }
+    implicitWidth: root.cardW
+    implicitHeight: root.cardH
+    minimumSize: Qt.size(440, 360)
     color: "transparent"
-    exclusionMode: ExclusionMode.Ignore
-    // Input is ALWAYS limited to the card: outside clicks and hover pass
-    // through to the windows below — frozen-app veils stay interactive
-    // (hover morph + Omi play-resume) while the popup is open. The popup
-    // closes via the toggle keybind or the card's close button.
-    mask: Region { item: card }
-    WlrLayershell.namespace: "tm-popup"
-    WlrLayershell.layer: WlrLayer.Overlay
-    // OnDemand: the card takes keyboard only after a deliberate click on it.
-    // (Exclusive would make Hyprland route ALL pointer input to this overlay
-    // surface, killing hover/click on the floating veils below — verified.)
-    WlrLayershell.keyboardFocus: WlrKeyboardFocus.OnDemand
-    onWidthChanged: root.maybeCenterCard()
-    onHeightChanged: root.maybeCenterCard()
+    onVisibleChanged: if (visible) popupFloatTimer.restart()
+    onWidthChanged: if (visible && width >= 440) { root.cardW = width; popupSizeSave.restart() }
+    onHeightChanged: if (visible && height >= 360) { root.cardH = height; popupSizeSave.restart() }
+    Timer {
+      id: popupSizeSave
+      interval: 500
+      onTriggered: {
+        root.setPref("cardW", String(root.cardW))
+        root.setPref("cardH", String(root.cardH))
+      }
+    }
+    onClosed: root.closePopup()
 
-    // Feeds the cursor position so the mascots' eyes can follow it (within
-    // the card — the mask blocks everything outside it anyway).
+    // Apply to this window only; no permanent compositor rules required.
+    Timer {
+      id: popupFloatTimer
+      interval: 100
+      repeat: true
+      property int attempts: 0
+      onRunningChanged: if (running) attempts = 0
+      onTriggered: {
+        if (++attempts >= 10) stop()
+        if (!popupFloatProc.running) popupFloatProc.running = true
+      }
+    }
+    Process {
+      id: popupFloatProc
+      command: root.capped(root.capJson, 2, ["hyprctl", "clients", "-j"])
+      stdout: StdioCollector {
+        waitForEnd: true
+        onStreamFinished: {
+          try {
+            var clients = JSON.parse(root.clip(text, root.capJson))
+            for (var i = 0; i < clients.length; i++) {
+              if (clients[i].initialTitle !== "Omarchy Task Manager") continue
+              if (clients[i].floating) { popupFloatTimer.stop(); return }
+              var address = root.safeAddr(clients[i].address)
+              if (!address) return
+              Quickshell.execDetached(["hyprctl", "dispatch",
+                'hl.dsp.window.float({ action = "set", window = "address:' + address + '" })'])
+              return
+            }
+          } catch (e) {}
+        }
+      }
+    }
+
+    // Feed pointer coordinates to the mascot inside the native window.
     MouseArea {
       anchors.fill: parent
       hoverEnabled: true
@@ -1641,9 +1661,9 @@ BarWidget {
 
     Rectangle {
       id: card
-      width: root.cardW
-      height: root.cardH
-      // Positioned by root.centerCard() on first open; DragHandler moves it.
+      width: popupWin.width
+      height: popupWin.height
+      // The compositor moves the toplevel; the card fills its content area.
       color: Color.popups.background
       border.color: Color.popups.border
       border.width: 1
@@ -1659,9 +1679,7 @@ BarWidget {
         }
       }
 
-      // Interceptor: swallows clicks on card padding so the full-screen
-      // close area behind the card does not fire. Also feeds cursor tracking
-      // (hovering the card never reaches the full-screen area).
+      // Track pointer movement over the card padding.
       MouseArea {
         anchors.fill: parent
         hoverEnabled: true
@@ -1687,9 +1705,8 @@ BarWidget {
             Layout.fillWidth: true
             Layout.preferredHeight: hdrTitle.implicitHeight + Style.space(8)
             DragHandler {
-              target: card
-              grabPermissions: PointerHandler.TakeOverForbidden
-              onActiveChanged: if (active) root.cardPosSet = true
+              target: null
+              onActiveChanged: if (active) popupWin.startSystemMove()
             }
             Row {
               spacing: Style.space(8)
@@ -2858,25 +2875,7 @@ BarWidget {
         }
         DragHandler {
           target: null
-          property real startW: 0
-          property real startH: 0
-          onActiveChanged: {
-            if (active) {
-              startW = root.cardW
-              startH = root.cardH
-            } else {
-              // Keep the card on screen, then persist.
-              if (card.x + card.width > popupWin.width - 4) card.x = Math.max(4, popupWin.width - card.width - 4)
-              if (card.y + card.height > popupWin.height - 4) card.y = Math.max(4, popupWin.height - card.height - 4)
-              root.setPref("cardW", String(root.cardW))
-              root.setPref("cardH", String(root.cardH))
-            }
-          }
-          onTranslationChanged: {
-            if (!active) return
-            root.cardW = Math.round(Math.max(440, Math.min(popupWin.width - 40, startW + translation.x)))
-            root.cardH = Math.round(Math.max(360, Math.min(popupWin.height - 40, startH + translation.y)))
-          }
+          onActiveChanged: if (active) popupWin.startSystemResize(Qt.RightEdge | Qt.BottomEdge)
         }
       }
     }
@@ -2896,7 +2895,7 @@ BarWidget {
       Text {
         textFormat: Text.PlainText
         text: "\uF0AE"
-        color: root.frozenCount > 0 ? Color.accent : Color.foreground
+        color: root.usageColor(Math.max(root.cpuNow, root.memNow))
         font.family: root.faFont
         font.pixelSize: Style.font.body
         anchors.verticalCenter: parent.verticalCenter
@@ -2906,7 +2905,7 @@ BarWidget {
         textFormat: Text.PlainText
         visible: root.barMode !== "off"
         text: "\uF2DB " + ("   " + root.cpuNow.toFixed(0)).slice(-3) + "%"
-        color: Qt.darker(Color.foreground, 1.3)
+        color: root.usageColor(root.cpuNow)
         font.family: root.faFont
         font.pixelSize: Style.font.caption
         anchors.verticalCenter: parent.verticalCenter
@@ -2929,7 +2928,7 @@ BarWidget {
           for (var s = start; s < n; s++) if (series[s] > max) max = series[s]
           max *= 1.15
           var step = width / 11
-          ctx.strokeStyle = Color.accent
+          ctx.strokeStyle = root.usageColor(root.cpuNow)
           ctx.lineWidth = 1.5
           ctx.beginPath()
           for (var i = 0; i < count; i++) {
@@ -2946,7 +2945,7 @@ BarWidget {
         textFormat: Text.PlainText
         visible: root.barMode !== "off"
         text: "\uF1B3 " + ("   " + root.memNow.toFixed(0)).slice(-3) + "%"
-        color: Qt.darker(Color.foreground, 1.3)
+        color: root.usageColor(root.memNow)
         font.family: root.faFont
         font.pixelSize: Style.font.caption
         anchors.verticalCenter: parent.verticalCenter
@@ -2969,7 +2968,7 @@ BarWidget {
           for (var s = start; s < n; s++) if (series[s] > max) max = series[s]
           max *= 1.15
           var step = width / 11
-          ctx.strokeStyle = Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.8)
+          ctx.strokeStyle = root.usageColor(root.memNow)
           ctx.lineWidth = 1.5
           ctx.beginPath()
           for (var i = 0; i < count; i++) {

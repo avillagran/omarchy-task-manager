@@ -238,7 +238,7 @@ QtQuick and brings the problem back. New files must use the pinned import.
 ## Layout
 
     manifest.json
-    BarWidget.qml                  bar pill + overlay card + veils
+    BarWidget.qml                  bar pill + native movable window + veils
     Shared.js                      in-memory state shared by widget instances
     ActivityGraph.qml, OmiFace.qml graph and mascot
     i18n.json                      EN/ES/PT/FR/DE
@@ -259,3 +259,20 @@ MIT, see [LICENSE](LICENSE).
 - **Omi**, the mascot blinking over your paused apps, was an idea by
   [@tahayvr](https://github.com/tahayvr). The vector path comes from the
   official Omarchy brand assets.
+
+### Pause notices and moving the panel
+
+Automatic pause notices show the application's desktop icon with a pause badge.
+The notice closes when all stops owned by that pause clear, including automatic
+recovery and manual resume. A partial or failed resume keeps it visible. Closing
+the watchdog also releases its notices; no notification-ID files are stored.
+Both engines share `bin/pause-notification.py` (stock Python, `notify-send` and
+`gdbus`). ImageMagick (`magick`) renders the badge in a private temporary directory;
+if rendering or icon lookup is unavailable, the notice uses the themed app icon
+and its explicit paused summary. Temporary images are removed after closure.
+
+The panel is a native window: drag its header, use the compositor's move shortcut,
+or resize it across monitors. Its size is saved after resizing. It follows normal
+window stacking and workspace behavior. It no longer captures a monitor-wide
+layer surface. CPU/RAM icons, percentages and bar graphs share the panel's usage
+colors: green below 50%, yellow from 50%, orange from 75%, red from 90%.

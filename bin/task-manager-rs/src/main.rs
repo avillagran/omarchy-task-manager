@@ -130,14 +130,6 @@ fn run_bounded(prog: &str, args: &[&str], secs: u64) -> bool {
     }
 }
 
-/// Fire-and-forget helper (notifications), reaped off-thread, bounded.
-fn spawn_bounded(prog: &'static str, args: Vec<String>, secs: u64) {
-    std::thread::spawn(move || {
-        let a: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_bounded(prog, &a, secs);
-    });
-}
-
 #[derive(Clone)]
 struct Win {
     pid: u64,
@@ -1747,16 +1739,41 @@ struct AutoPause {
     name: String,
     mb: u64,
     owned: Marker,
+    notification: Option<std::process::Child>,
+}
+
+impl Drop for AutoPause {
+    fn drop(&mut self) {
+        self.close_notification();
+    }
 }
 
 impl AutoPause {
+    fn close_notification(&mut self) {
+        if let Some(mut child) = self.notification.take() {
+            drop(child.stdin.take());
+            std::thread::spawn(move || {
+                let end = std::time::Instant::now() + std::time::Duration::from_secs(6);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) if std::time::Instant::now() < end =>
+                            std::thread::sleep(std::time::Duration::from_millis(50)),
+                        _ => { let _ = child.kill(); let _ = child.wait(); break; }
+                    }
+                }
+            });
+        }
+    }
     fn prune(&mut self) -> bool {
         let m = marker_read();
         self.owned.pids.retain(|(p, st)| {
             m.pids.contains(&(*p, *st)) && start_time(*p) == Some(*st) && pid_stopped(*p)
         });
         self.owned.scopes.retain(|s| m.scopes.contains(s) && scope_frozen(s));
-        !self.owned.pids.is_empty() || !self.owned.scopes.is_empty()
+        let active = !self.owned.pids.is_empty() || !self.owned.scopes.is_empty();
+        if !active { self.close_notification(); }
+        active
     }
 
     fn resume(&mut self) -> bool {
@@ -1777,7 +1794,9 @@ impl AutoPause {
                 true
             }
         });
-        self.owned.pids.is_empty() && self.owned.scopes.is_empty()
+        let done = self.owned.pids.is_empty() && self.owned.scopes.is_empty();
+        if done { self.close_notification(); }
+        done
     }
 }
 
@@ -1849,19 +1868,15 @@ fn freeze_biggest(skip: &std::collections::BTreeSet<String>) -> Option<AutoPause
     }
     // The user must KNOW an app was auto-paused, or it looks like a crash.
     let (title, body) = notify_autopause_text(&name, mb);
-    spawn_bounded(
-        "notify-send",
-        vec![
-            "-a".into(),
-            "Task Manager".into(),
-            "-u".into(),
-            "critical".into(),
-            cap_str(&title),
-            body,
-        ],
-        10,
-    );
-    Some(AutoPause { name, mb, owned })
+    // Both engines use the same bounded renderer and notification lifetime.
+    // The release executable lives at bin/task-manager-rs/target/release.
+    let helper = env::current_exe().ok().and_then(|p| {
+        p.ancestors().nth(4).map(|bin| bin.join("pause-notification.py"))
+    });
+    let notification = helper.and_then(|p| Command::new("python3")
+        .args(["-I", "-S"]).arg(p).args([&name, &cap_str(&title), &body])
+        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().ok());
+    Some(AutoPause { name, mb, owned, notification })
 }
 
 /// Localized auto-pause notification text (daemon has no i18n.json access).

@@ -1640,15 +1640,16 @@ def cmd_governor_explain():
 _children = []
 
 
-def notify(title, body):
+def notify(name, title, body):
     import subprocess
     try:
-        p = subprocess.Popen(["notify-send", "-a", "Task Manager", "-u", "critical", title, body],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, close_fds=True)
-        _children.append((p, time.monotonic() + 10))
+        return subprocess.Popen(["python3", "-I", "-S",
+                                 os.path.join(os.path.dirname(__file__), "pause-notification.py"),
+                                 name, title, body], stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                close_fds=True)
     except OSError:
-        pass
+        return None
 
 
 def reap():
@@ -1694,15 +1695,25 @@ def recovery_healthy(total, pct, some, full, cpu, cpu_max, crit_avail, recover):
 class AutoPause:
     def __init__(self, name, mb, before, after):
         self.name, self.mb = name, mb
+        self.notification = None
         self.pids = [p for p in after[0] if p not in before[0]]
         self.scopes = [s for s in after[1] if s not in before[1]]
+
+    def close_notification(self):
+        if self.notification is not None:
+            self.notification.stdin.close()
+            _children.append((self.notification, time.monotonic() + 6))
+            self.notification = None
 
     def prune(self):
         pids, scopes = marker_read()
         self.pids = [p for p in self.pids if p in pids and start_time(p[0]) == p[1]
                      and pid_stopped(p[0])]
         self.scopes = [s for s in self.scopes if s in scopes and scope_frozen(s)]
-        return bool(self.pids or self.scopes)
+        active = bool(self.pids or self.scopes)
+        if not active:
+            self.close_notification()
+        return active
 
     def resume(self):
         # Only the exact stops this watchdog owns, never the whole comm family.
@@ -1714,7 +1725,10 @@ class AutoPause:
             if signal_pid(p, st, signal.SIGCONT):
                 marker_remove(p)
                 self.pids.remove((p, st))
-        return not (self.pids or self.scopes)
+        done = not (self.pids or self.scopes)
+        if done:
+            self.close_notification()
+        return done
 
 
 def freeze_biggest(skip):
@@ -1760,7 +1774,7 @@ def freeze_biggest(skip):
     if not (paused.pids or paused.scopes):
         return None
     title, body = notify_text(name, mb)
-    notify(cap_str(title), body)
+    paused.notification = notify(name, cap_str(title), body)
     return paused
 
 
