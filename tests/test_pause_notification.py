@@ -50,6 +50,7 @@ class Notification(unittest.TestCase):
             if args[0] == 'notify-send':
                 image = Path(args[args.index('-i') + 1])
                 self.assertTrue(image.is_file())
+                self.assertIn('string:x-omarchy-app-icon-path:' + str(image), args)
                 self.assertEqual(image.parent.stat().st_mode & 0o777, 0o700)
                 pixel = actual_run(['magick', str(image), '-format', '%[pixel:p{64,70}]', 'info:'])
                 self.assertIn(b'26,27,38', pixel.replace(b' ', b''))

@@ -276,3 +276,8 @@ or resize it across monitors. Its size is saved after resizing. It follows norma
 window stacking and workspace behavior. It no longer captures a monitor-wide
 layer surface. CPU/RAM icons, percentages and bar graphs share the panel's usage
 colors: green below 50%, yellow from 50%, orange from 75%, red from 90%.
+
+The local Omarchy notification service can preserve the temporary icon across
+reloads via the optional `x-omarchy-app-icon-path` hint. The service must remove
+the visible card on the sender's `CloseNotification`, as well as drop its actions;
+otherwise a completed pause leaves a stale toast despite a successful close.

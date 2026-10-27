@@ -70,8 +70,13 @@ def serve(name, title, body, stream):
             except (OSError, subprocess.SubprocessError):
                 pass
         try:
-            reply = run(['notify-send', '--print-id', '-a', 'Task Manager', '-u', 'critical',
-                         '-i', icon, '--', title[:256], body[:1024]])
+            args = ['notify-send', '--print-id', '-a', 'Task Manager', '-u', 'critical', '-i', icon]
+            # Quickshell turns file icons into process-local image:// URLs.
+            # The local notification service uses this optional hint to copy
+            # the original before persisting a toast across a shell reload.
+            if icon.startswith('/'):
+                args += ['-h', 'string:x-omarchy-app-icon-path:' + icon]
+            reply = run(args + ['--', title[:256], body[:1024]])
             if re.fullmatch(rb'[0-9]{1,10}\s*', reply) and 0 < int(reply) <= 0xffffffff:
                 notification = str(int(reply))
             stream.read(1)  # Owner closes stdin only after all owned stops clear.
