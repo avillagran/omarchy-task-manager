@@ -80,7 +80,7 @@ speak the same commands and JSON:
 The card starts on the light engine at once. Unless you chose Light in the
 gear panel, it also runs `bin/task-manager-build.sh`
 (`cargo build --release --locked --offline` on `bin/task-manager-rs`; the
-first time about a minute, later a no-op) and switches to the full engine
+first time about a minute, later an incremental check) and switches to the full engine
 when it builds. Without `cargo`, or if the build fails, it stays on the
 light engine and the gear panel says why. Nothing is downloaded.
 
@@ -281,3 +281,19 @@ The local Omarchy notification service can preserve the temporary icon across
 reloads via the optional `x-omarchy-app-icon-path` hint. The service must remove
 the visible card on the sender's `CloseNotification`, as well as drop its actions;
 otherwise a completed pause leaves a stale toast despite a successful close.
+
+### Rust builds and live reload
+
+Rust still builds automatically on first use and after source updates, offline
+and locked. Cargo output lives exclusively in
+`${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-task-manager/rust/<installation-id>/`.
+Both the build and launch scripts share the same cache resolver; separate source
+installations have separate output directories. Cache subdirectories are private
+(0700), and symlinks are refused. A cache configured inside a plugin falls back
+to the normal user cache to avoid triggering live reload.
+
+No build artifacts, lock files or Python bytecode are written under the installed
+plugin. Existing `bin/task-manager-rs/target` artifacts are ignored and need not
+be deleted or rebuilt by hand. Removing the Rust cache frees the build outputs;
+the plugin automatically rebuilds on its next load. The Python fallback remains
+available when Cargo is missing or a build fails.

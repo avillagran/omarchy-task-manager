@@ -1869,13 +1869,15 @@ fn freeze_biggest(skip: &std::collections::BTreeSet<String>) -> Option<AutoPause
     // The user must KNOW an app was auto-paused, or it looks like a crash.
     let (title, body) = notify_autopause_text(&name, mb);
     // Both engines use the same bounded renderer and notification lifetime.
-    // The release executable lives at bin/task-manager-rs/target/release.
-    let helper = env::current_exe().ok().and_then(|p| {
-        p.ancestors().nth(4).map(|bin| bin.join("pause-notification.py"))
-    });
-    let notification = helper.and_then(|p| Command::new("python3")
-        .args(["-I", "-S"]).arg(p).args([&name, &cap_str(&title), &body])
-        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().ok());
+    // Cargo output lives outside the source tree. The launcher identifies
+    // this installation; direct developer builds use their compiled source path.
+    let bin = env::var_os("TM_PLUGIN_BIN_DIR").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().expect("crate has bin parent").to_path_buf());
+    let notification = Command::new("python3")
+        .args(["-I", "-S"]).arg(bin.join("pause-notification.py"))
+        .args([&name, &cap_str(&title), &body])
+        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().ok();
     Some(AutoPause { name, mb, owned, notification })
 }
 
