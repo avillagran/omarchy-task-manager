@@ -1165,11 +1165,28 @@ def cmd_pref(key, value):
     val = pref_value(kind, value) if kind else None
     if val is None:
         return
-    v = read_prefs()
-    v[key] = val
     d = state_dir()
-    if d:
+    if not d:
+        return
+    fd = None
+    try:
+        deadline = time.monotonic() + 2.0
+        while fd is None:
+            fd = d.try_lock("prefs.lock")
+            if fd is None:
+                if time.monotonic() >= deadline:
+                    warn("preferences lock timed out")
+                    return
+                time.sleep(.01)
+        # Serialize the whole read/modify/replace, across both engines.
+        v = read_prefs()
+        v[key] = val
         d.write_atomic(PREFS, json.dumps(v, separators=(",", ":")).encode())
+    except OSError:
+        warn("preferences lock unavailable")
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def cmd_history():

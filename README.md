@@ -304,3 +304,5 @@ reserved for the Omarchy bar. Saved sizes are clamped to that area, including
 sizes inherited from older versions that recorded a tiled/full-screen window.
 Initial compositor negotiation is never saved as a user resize. Native dragging
 and resizing remain available after placement; no Hyprland config is changed.
+Concurrent preference updates (including window width and height) share a bounded
+private lock in both engines, so one saved setting cannot overwrite another.

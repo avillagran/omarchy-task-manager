@@ -1682,11 +1682,20 @@ fn cmd_pref(key: &str, value: &str) {
     let Some(val) = pref_value(kind, value) else {
         return;
     };
+    let Some(d) = state_dir() else { return };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let _lock = loop {
+        match d.try_lock("prefs.lock") {
+            Ok(Some(fd)) => break fd,
+            Ok(None) if std::time::Instant::now() < deadline =>
+                std::thread::sleep(std::time::Duration::from_millis(10)),
+            _ => { eprintln!("task-manager: preferences lock unavailable"); return; }
+        }
+    };
+    // Same lock as Python: protect the whole read/modify/replace operation.
     let mut v = read_prefs();
     v[key] = val;
-    if let Some(d) = state_dir() {
-        let _ = d.write_atomic(PREFS, v.to_string().as_bytes());
-    }
+    let _ = d.write_atomic(PREFS, v.to_string().as_bytes());
 }
 
 /// The history the watchdog wrote, re-serialized (never echoed raw).
