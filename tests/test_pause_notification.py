@@ -29,7 +29,7 @@ class Notification(unittest.TestCase):
             return b'42\n'
         with patch.object(n, 'app_icon', return_value=('google-chrome', None)), patch.object(n, 'run', side_effect=run):
             n.serve('chrome', 'Paused', 'stable', Stream())
-        self.assertEqual(calls[0][calls[0].index('-i') + 1], 'google-chrome')
+        self.assertEqual(calls[0][calls[0].index('-i') + 1], 'media-playback-pause')
         self.assertEqual(calls[1][-2:], ['org.freedesktop.Notifications.CloseNotification', '42'])
 
     def test_bad_id_and_notify_failure_never_close_an_unrelated_notice(self):
@@ -42,7 +42,7 @@ class Notification(unittest.TestCase):
         # Use real renderer, but mock both D-Bus clients.
         source = Path('/usr/share/icons/hicolor/128x128/apps/google-chrome.png')
         if not source.exists():
-            self.skipTest('Chrome icon not installed')
+            source = ROOT / 'preview.png'
         actual_run = n.run
         def run(args):
             if args[0] == 'magick':

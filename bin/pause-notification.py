@@ -2,7 +2,7 @@
 
 All external calls are bounded. EOF closes exactly the ID returned by Notify,
 including when the watchdog exits. Rendering is optional; missing tools/icons
-fall back to a themed icon and the explicit paused summary.
+fall back to a fixed pause icon and the explicit paused summary.
 """
 import configparser
 import os
@@ -110,7 +110,8 @@ def serve(name, title, body, stream):
     notification = None
     # Private, unpredictable directory; files survive until CloseNotification.
     with tempfile.TemporaryDirectory(prefix='task-manager-notice-') as directory:
-        icon, source = app_icon(name)
+        _, source = app_icon(name)
+        icon = "media-playback-pause"
         if source:
             try:
                 if source.stat().st_size <= 2 * 1024 * 1024:

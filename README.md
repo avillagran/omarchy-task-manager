@@ -269,7 +269,7 @@ recovery and manual resume. A partial or failed resume keeps it visible. Closing
 the watchdog also releases its notices; no notification-ID files are stored.
 Both engines share `bin/pause-notification.py` (stock Python, `notify-send` and
 `gdbus`). ImageMagick (`magick`) renders the badge in a private temporary directory;
-if rendering or icon lookup is unavailable, the notice uses the themed app icon
+if rendering or icon lookup is unavailable, the notice uses a fixed generic pause icon
 and its explicit paused summary. Temporary images are removed after closure.
 
 The panel is a native window: drag its header, use the compositor's move shortcut,
