@@ -106,7 +106,7 @@ describe() {
   esac
 }
 
-has_require() { [ -f "$MAIN" ] && grep -qxF "$REQUIRE" "$MAIN"; }
+has_require() { [ -f "$MAIN" ] && grep -qxF -e "$REQUIRE" -e "require(\"$MOD\")" "$MAIN"; }
 applied() { [ -f "$FILE" ] && has_require; }
 
 confirm() {
@@ -120,15 +120,6 @@ confirm() {
                       "Appliquer ces modifications ? [o/N] " "Diese Änderungen anwenden? [j/N] ")" reply
     [[ "$reply" =~ ^[sSyYoOjJ]$ ]]
   fi
-}
-
-# Replace a file atomically, keeping its permissions when it exists.
-write_atomic() { # $1=target, content on stdin
-  local tmp
-  tmp=$(mktemp "$1.tmp.XXXXXX")
-  cat >"$tmp"
-  [ -e "$1" ] && chmod --reference="$1" "$tmp"
-  mv -f -- "$tmp" "$1"
 }
 
 refuse_symlinks() {
@@ -156,12 +147,6 @@ describe
 echo
 
 if [ "$action" = apply ]; then
-  if applied; then
-    say "It is already applied ($FILE). Nothing to do." "Ya está aplicado ($FILE). No hay nada que hacer." \
-        "Já está aplicado ($FILE). Nada a fazer." "C'est déjà appliqué ($FILE). Rien à faire." \
-        "Ist bereits angewendet ($FILE). Nichts zu tun."
-    exit 0
-  fi
   say "What will change:" "Qué se va a cambiar:" "O que vai mudar:" "Ce qui va changer :" "Was sich ändert:"
   say "  1. Create $FILE with:" "  1. Crear $FILE con:" "  1. Criar $FILE com:" "  1. Créer $FILE avec :" \
       "  1. $FILE anlegen mit:"
@@ -193,14 +178,7 @@ if [ "$action" = apply ]; then
         "Annulé : rien n'a été modifié." "Abgebrochen: es wurde nichts geändert."
     exit 130
   fi
-  content | write_atomic "$FILE"
-  if ! has_require; then
-    backup="$MAIN.task-manager-backup-$(date +%Y%m%d-%H%M%S)"
-    cp -p -- "$MAIN" "$backup"
-    { cat -- "$MAIN"; [ -z "$(tail -c1 -- "$MAIN")" ] || echo; echo "$REQUIRE"; } | write_atomic "$MAIN"
-    say "Backup: $backup" "Respaldo: $backup" "Cópia de segurança: $backup" "Sauvegarde : $backup" \
-        "Sicherung: $backup"
-  fi
+  content | timeout 6 /usr/bin/python3 -I -S "$DIR/task-manager-config.py" apply "$MOD" "$HYPR"
 else
   if [ ! -f "$FILE" ] && ! has_require; then
     say "It is not applied. Nothing to do." "No está aplicado. No hay nada que hacer." \
@@ -223,16 +201,7 @@ else
         "Annulé : rien n'a été modifié." "Abgebrochen: es wurde nichts geändert."
     exit 130
   fi
-  # The require line goes first: a require of a missing file would break
-  # the Hyprland config.
-  if has_require; then
-    backup="$MAIN.task-manager-backup-$(date +%Y%m%d-%H%M%S)"
-    cp -p -- "$MAIN" "$backup"
-    grep -vxF -- "$REQUIRE" "$MAIN" | write_atomic "$MAIN" || true
-    say "Backup: $backup" "Respaldo: $backup" "Cópia de segurança: $backup" "Sauvegarde : $backup" \
-        "Sicherung: $backup"
-  fi
-  rm -f -- "$FILE"
+  content | timeout 6 /usr/bin/python3 -I -S "$DIR/task-manager-config.py" remove "$MOD" "$HYPR"
 fi
 
 hyprctl reload >/dev/null 2>&1 || true

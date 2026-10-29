@@ -95,10 +95,11 @@ it resumes every app it paused and drops every memory limit it set before
 exiting. What stays behind, all yours to delete:
 
 - `~/.local/state/omarchy-task-manager/` (preferences and card size)
-- `~/.cache/omarchy-task-manager/` (the light engine's bytecode cache)
+- `~/.cache/omarchy-task-manager/` (Python bytecode and Rust build outputs)
 - any extra you applied from the gear panel: press **Remove** there first, or
-  delete `~/.config/hypr/task-manager-*.lua` and their `require("hypr.task-manager-…")`
-  lines in `hyprland.lua`
+  remove their standalone `require("hypr.task-manager-…")` (or legacy
+  `require("task-manager-…")`) lines from `hyprland.lua` and save successfully
+  **before** deleting the corresponding unmodified generated module
 
 ## What it touches
 
@@ -147,7 +148,7 @@ explains the change, shows the exact lines and asks; only a "yes" writes
 anything. For each extra it creates one file of its own,
 `~/.config/hypr/task-manager-<extra>.lua`, and adds one
 `require("hypr.task-manager-<extra>")` line to `hyprland.lua`, after saving
-a backup copy next to it (`hyprland.lua.task-manager-backup-<date>`). It
+a private backup next to it (`.task-manager-backup-<random>`). It
 refuses symlinked files (dotfiles managers) and runs nothing as root.
 **Remove** undoes both the same way. Hyprland reloads on its own; the panel
 reads the binds back from Hyprland. You can also add the lines yourself:
@@ -306,3 +307,18 @@ Initial compositor negotiation is never saved as a user resize. Native dragging
 and resizing remain available after placement; no Hyprland config is changed.
 Concurrent preference updates (including window width and height) share a bounded
 private lock in both engines, so one saved setting cannot overwrite another.
+
+Search accepts at most 256 characters. Native clipboard import is disabled;
+Ctrl+V and Shift+Insert explicitly read a capped, two-second `wl-paste` stream
+(stock `wl-clipboard` on Omarchy). Selection editing and typed text stay local.
+App icons resolve only validated theme names; missing/invalid entries use the
+letter fallback. Notification badge rendering has independent address-space,
+CPU, file-size and pixel-cache limits and strips metadata.
+
+Optional Hyprland changes remain opt-in and confirmation-gated. The config
+helper reads the full owned regular file up to 256 KiB, preserves unrelated
+bytes and its mode, and makes private recovery backups. It migrates legacy
+standalone references and removes both forms before deleting a generated module.
+Unknown/edited modules, unsafe files and read/replace failures are refused;
+the module remains in place when an update fails. No desktop config is changed
+by normal plugin loading or Rust compilation.

@@ -1,0 +1,11 @@
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
+const code=fs.readFileSync(require('node:path').join(__dirname,'../UiSafety.js'),'utf8').replace(/^\.pragma.*\n/,'');
+const s={};vm.createContext(s);vm.runInContext(code,s);
+for(const value of ['.','..','/tmp/icon','file:///tmp/icon','https://host/icon','image://icon/bad','../bad','x/y','bad\nname'])assert.equal(s.themeName(value),'');
+for(const value of ['org.chromium.Chromium','google-chrome','foo_bar-1'])assert.equal(s.themeName(value),value);
+assert.equal(s.edit('abcd',1,3,'XYZ').text,'aXYZd');
+assert.equal(s.edit('abc',0,3,'\n\x00áé\r').text,'áé');
+assert.equal(s.edit('x'.repeat(256),256,256,'ignored').text.length,256);
+assert.equal(s.edit('',0,0,'y'.repeat(100000)).text.length,256);
+assert.equal(s.edit('abcd',3,1,'X').text,'aXd');
+console.log('PASS: theme names, bounded typed/paste edits, selection replacement');

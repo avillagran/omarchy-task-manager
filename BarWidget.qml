@@ -12,6 +12,7 @@ import Quickshell.Wayland
 import qs.Ui
 import qs.Commons
 import "Shared.js" as Shared
+import "UiSafety.js" as UiSafety
 
 BarWidget {
   id: root
@@ -692,12 +693,24 @@ BarWidget {
     for (var i = 0; i < tries.length && src === ""; i++) {
       if (!tries[i]) continue
       var e = DesktopEntries.heuristicLookup(tries[i])
-      if (e && e.icon) src = Quickshell.iconPath(e.icon, true)
-      if (src === "") src = Quickshell.iconPath(tries[i], true)
+      var entryIcon = e ? UiSafety.themeName(e.icon) : ""
+      var fallbackIcon = UiSafety.themeName(tries[i])
+      if (entryIcon) src = Quickshell.iconPath(entryIcon, true)
+      if (src === "" && fallbackIcon) src = Quickshell.iconPath(fallbackIcon, true)
     }
     // Entries load asynchronously: remember misses only once they exist.
+    var cachedKeys = Object.keys(root.iconCache)
+    if (cachedKeys.length >= 512) delete root.iconCache[cachedKeys[0]]
     if (src !== "" || DesktopEntries.applications.values.length > 0) root.iconCache[key] = src
     return src
+  }
+  Process {
+    id: searchPasteProc
+    command: root.capped(256, 2, ["wl-paste", "--no-newline"])
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (root.popupOpen && searchField.activeFocus) searchField.insertSafe(text)
+    }
   }
   Connections {
     target: DesktopEntries.applications
@@ -2206,6 +2219,41 @@ BarWidget {
           spacing: Style.space(6)
           TextField {
             id: searchField
+            // Native editable TextInput can import an unbounded foreign
+            // clipboard on selection changes. Keep it permanently read-only;
+            // typed edits and explicit paste use a bounded path instead.
+            readOnly: true
+            maximumLength: 256
+            function insertSafe(value) {
+              var edit = UiSafety.edit(text, selectionStart, selectionEnd, value)
+              text = edit.text
+              cursorPosition = edit.cursor
+              deselect()
+            }
+            Keys.onPressed: function(event) {
+              var control = (event.modifiers & (Qt.ControlModifier | Qt.MetaModifier)) !== 0
+              if ((control && event.key === Qt.Key_V)
+                  || ((event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_Insert)) {
+                if (!searchPasteProc.running) searchPasteProc.running = true
+                event.accepted = true
+              } else if (control && event.key === Qt.Key_A) {
+                selectAll()
+                event.accepted = true
+              } else if (!control && (event.key === Qt.Key_Backspace || event.key === Qt.Key_Delete)) {
+                var a = selectionStart, b = selectionEnd
+                if (a === b) {
+                  if (event.key === Qt.Key_Backspace) a = Math.max(0, cursorPosition - 1)
+                  else b = Math.min(text.length, cursorPosition + 1)
+                }
+                var edit = UiSafety.edit(text, a, b, "")
+                text = edit.text; cursorPosition = edit.cursor; deselect()
+                event.accepted = true
+              } else if (!control && !(event.modifiers & Qt.AltModifier)
+                         && event.text && event.text.charCodeAt(0) >= 32) {
+                insertSafe(event.text)
+                event.accepted = true
+              }
+            }
             Layout.fillWidth: true
             Layout.preferredHeight: 26
             verticalPadding: 2

@@ -5,6 +5,9 @@ including when the watchdog exits. Rendering is optional; missing tools/icons
 fall back to a themed icon and the explicit paused summary.
 """
 import configparser
+import os
+import resource
+import stat
 from pathlib import Path
 import re
 import subprocess
@@ -12,9 +15,35 @@ import sys
 import tempfile
 
 
+def limit_image():
+    os.umask(0o077)
+    for kind, ceiling in [(resource.RLIMIT_AS, 256 * 1024 * 1024),
+                          (resource.RLIMIT_FSIZE, 4 * 1024 * 1024), (resource.RLIMIT_CPU, 2)]:
+        _, hard = resource.getrlimit(kind)
+        if hard != resource.RLIM_INFINITY:
+            ceiling = min(ceiling, hard)
+        resource.setrlimit(kind, (ceiling, ceiling))
+
+
 def run(args, timeout=2):
     return subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                          stderr=subprocess.DEVNULL, timeout=timeout, check=True).stdout
+                          stderr=subprocess.DEVNULL, timeout=timeout, check=True,
+                          preexec_fn=limit_image if args[0] == "magick" else None).stdout
+
+
+def desktop_text(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.getuid()):
+            raise ValueError("not a trusted regular desktop file")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            data = stream.read(65537)
+        if len(data) > 65536:
+            raise ValueError("desktop file too large")
+        return data.decode("utf-8")
+    finally:
+        os.close(fd)
 
 
 def app_icon(name):
@@ -26,10 +55,8 @@ def app_icon(name):
         for desktop in [icon, safe]:
             p = root / 'applications' / (desktop + '.desktop')
             try:
-                if p.stat().st_size > 65536:
-                    continue
                 c = configparser.ConfigParser(interpolation=None)
-                c.read_string(p.read_text())
+                c.read_string(desktop_text(p))
                 value = c.get('Desktop Entry', 'Icon', fallback='')
                 if re.fullmatch(r'[a-zA-Z0-9._-]{1,128}', value):
                     icon = value
@@ -60,12 +87,13 @@ def serve(name, title, body, stream):
                     image = Path(directory) / 'paused.png'
                     # App artwork plus a visible pause badge, rendered locally.
                     run(['magick', '-limit', 'memory', '32MiB', '-limit', 'map', '32MiB',
+                         '-limit', 'disk', '32MiB', '-limit', 'thread', '1',
                          '-background', 'none', str(source), '-resize', '96x96',
                          '-gravity', 'center', '-extent', '96x96',
                          '-fill', '#e0af68', '-stroke', '#1a1b26', '-strokewidth', '2',
                          '-draw', 'roundrectangle 48,48 94,94 10,10',
                          '-fill', '#1a1b26', '-stroke', 'none',
-                         '-draw', 'rectangle 61,59 67,83 rectangle 76,59 82,83', str(image)])
+                         '-draw', 'rectangle 61,59 67,83 rectangle 76,59 82,83', '-strip', str(image)])
                     icon = str(image)
             except (OSError, subprocess.SubprocessError):
                 pass

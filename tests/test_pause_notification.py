@@ -46,12 +46,14 @@ class Notification(unittest.TestCase):
         actual_run = n.run
         def run(args):
             if args[0] == 'magick':
+                self.assertIn('-strip', args)
                 return actual_run(args)
             if args[0] == 'notify-send':
                 image = Path(args[args.index('-i') + 1])
                 self.assertTrue(image.is_file())
                 self.assertIn('string:x-omarchy-app-icon-path:' + str(image), args)
                 self.assertEqual(image.parent.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(image.stat().st_mode & 0o777, 0o600)
                 pixel = actual_run(['magick', str(image), '-format', '%[pixel:p{64,70}]', 'info:'])
                 self.assertIn(b'26,27,38', pixel.replace(b' ', b''))
                 return b'123\n'
@@ -90,6 +92,19 @@ class Notification(unittest.TestCase):
                 if child.poll() is None:
                     child.kill()
                     child.wait()
+
+    def test_desktop_metadata_reads_are_bounded_and_reject_special_files(self):
+        import os
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'app.desktop'
+            path.write_text('[Desktop Entry]\nIcon=google-chrome\n')
+            self.assertIn('google-chrome', n.desktop_text(path))
+            path.write_bytes(b'x'*65537)
+            with self.assertRaises(ValueError):n.desktop_text(path)
+            path.unlink();os.mkfifo(path)
+            with self.assertRaises(ValueError):n.desktop_text(path)
+            path.unlink();path.symlink_to(Path(directory)/'elsewhere')
+            with self.assertRaises(OSError):n.desktop_text(path)
 
     def test_partial_resume_retains_notice_until_final_stop_clears(self):
         paused = tm.AutoPause('app', 100, ([], []), ([(12, 1)], []))
