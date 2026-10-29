@@ -297,3 +297,10 @@ plugin. Existing `bin/task-manager-rs/target` artifacts are ignored and need not
 be deleted or rebuilt by hand. Removing the Rust cache frees the build outputs;
 the plugin automatically rebuilds on its next load. The Python fallback remains
 available when Cargo is missing or a build fails.
+
+On each open the native panel is centered inside the cursor monitor's usable
+work area, leaving 24 logical pixels on every side in addition to the space
+reserved for the Omarchy bar. Saved sizes are clamped to that area, including
+sizes inherited from older versions that recorded a tiled/full-screen window.
+Initial compositor negotiation is never saved as a user resize. Native dragging
+and resizing remain available after placement; no Hyprland config is changed.

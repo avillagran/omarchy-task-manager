@@ -79,8 +79,6 @@ BarWidget {
   property var background: []
   property bool pressureCritical: false
   property real dismissedAt: 0
-  property bool cardPosSet: false
-  property string cardPosScreen: ""
   // Popup visibility is SHARED across instances in memory (Shared.js). The
   // shell preloads a ghost BarWidget instance and its IpcHandler/open()
   // calls can land on the ghost (whose popup would be invisible); only the
@@ -951,16 +949,11 @@ BarWidget {
     root.writePopupState(false)
   }
 
-  function centerCard() { root.cardPosSet = true }
-
   onPopupOpenChanged: {
     if (root.popupOpen) {
-      // Resolve the cursor's monitor fresh on every open.
-      if (!cursorScreenProc.running) cursorScreenProc.running = true
       // No ownership yet? Re-probe: a dead owner instance is claimable now,
       // so the popup can actually render.
       if (!root.veilOwner) root.veilOwner = Shared.claim(root)
-      if (!root.cardPosSet) root.centerCard()
       root.refresh()
       root.refreshHistory()
       root.readKeybind()
@@ -1545,53 +1538,6 @@ BarWidget {
   }
   property string veilLastActive: ""
 
-  // The popup must open where the user's ATTENTION is. Focus is wrong: after
-  // moving a window across monitors the focus sits on the other screen and
-  // the card "disappears" there. The cursor's monitor is the right answer
-  // for both the bar click and SUPER+SHIFT+T — resolved fresh at open time.
-  property var popupScreen: null
-  Process {
-    id: cursorScreenProc
-    command: root.capped(256, 2, ["hyprctl", "cursorpos"])
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var m = /^(-?\d{1,6})[, ]+\s*(-?\d{1,6})\s*$/.exec(root.clip(text, 256))
-        if (!m) return
-        var cx = parseInt(m[1]), cy = parseInt(m[2])
-        for (var i = 0; i < root.monitors.length; i++) {
-          var mon = root.monitors[i]
-          if (cx >= mon.x && cx < mon.x + mon.w && cy >= mon.y && cy < mon.y + mon.h) {
-            for (var j = 0; j < Quickshell.screens.length; j++) {
-              if (Quickshell.screens[j].name === mon.name) {
-                root.popupScreen = Quickshell.screens[j]
-                popupWin.screen = root.popupScreen
-                // Card position is relative to the popup window: a position
-                // dragged on one monitor is off-center (or off-screen) on
-                // another — re-center when the target screen changes.
-                if (root.cardPosScreen !== mon.name) {
-                  root.cardPosScreen = mon.name
-                  root.cardPosSet = false
-                  Qt.callLater(function() { if (!root.cardPosSet) root.centerCard() })
-                }
-                return
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  function focusedScreen() {
-    for (var i = 0; i < root.monitors.length; i++) {
-      if (!root.monitors[i].focused) continue
-      for (var j = 0; j < Quickshell.screens.length; j++)
-        if (Quickshell.screens[j].name === root.monitors[i].name)
-          return Quickshell.screens[j]
-    }
-    return Quickshell.screens.length > 0 ? Quickshell.screens[0] : null
-  }
-
   // Native toplevel: the compositor owns moving/resizing across outputs.
   FloatingWindow {
     id: popupWin
@@ -1599,51 +1545,67 @@ BarWidget {
     visible: root.popupOpen && root.veilOwner
     implicitWidth: root.cardW
     implicitHeight: root.cardH
-    minimumSize: Qt.size(440, 360)
+    minimumSize: Qt.size(Math.min(440, root.cardW), Math.min(360, root.cardH))
     color: "transparent"
-    onVisibleChanged: if (visible) popupFloatTimer.restart()
-    onWidthChanged: if (visible && width >= 440) { root.cardW = width; popupSizeSave.restart() }
-    onHeightChanged: if (visible && height >= 360) { root.cardH = height; popupSizeSave.restart() }
+    property bool placing: true
+    onVisibleChanged: {
+      placing = true
+      popupSizeSave.stop()
+      if (visible) popupPlaceRetry.restart()
+      else popupPlaceRetry.stop()
+    }
+    // Initial tiled/full-screen geometry is compositor negotiation, not a
+    // user resize. Never persist it before the work-area placement completes.
+    onWidthChanged: if (visible && !placing && width > 0) { root.cardW = width; popupSizeSave.restart() }
+    onHeightChanged: if (visible && !placing && height > 0) { root.cardH = height; popupSizeSave.restart() }
     Timer {
       id: popupSizeSave
       interval: 500
-      onTriggered: {
+      onTriggered: if (popupWin.visible && !popupWin.placing) {
         root.setPref("cardW", String(root.cardW))
         root.setPref("cardH", String(root.cardH))
       }
     }
     onClosed: root.closePopup()
 
-    // Apply to this window only; no permanent compositor rules required.
     Timer {
-      id: popupFloatTimer
-      interval: 100
+      id: popupPlaceRetry
+      interval: 150
       repeat: true
       property int attempts: 0
       onRunningChanged: if (running) attempts = 0
       onTriggered: {
-        if (++attempts >= 10) stop()
-        if (!popupFloatProc.running) popupFloatProc.running = true
+        if (popupPlaceProc.running) return
+        if (++attempts > 20) {
+          stop()
+          popupWin.placing = false
+          console.warn("Task Manager: could not confirm initial window placement")
+          return
+        }
+        popupPlaceProc.running = true
       }
     }
     Process {
-      id: popupFloatProc
-      command: root.capped(root.capJson, 2, ["hyprctl", "clients", "-j"])
+      id: popupPlaceProc
+      command: root.capped(2048, 6, ["python3", "-I", "-S", root.binDir + "/task-manager-place.py",
+                                     String(root.cardW), String(root.cardH)])
       stdout: StdioCollector {
         waitForEnd: true
         onStreamFinished: {
           try {
-            var clients = JSON.parse(root.clip(text, root.capJson))
-            for (var i = 0; i < clients.length; i++) {
-              if (clients[i].initialTitle !== "Omarchy Task Manager") continue
-              if (clients[i].floating) { popupFloatTimer.stop(); return }
-              var address = root.safeAddr(clients[i].address)
-              if (!address) return
-              Quickshell.execDetached(["hyprctl", "dispatch",
-                'hl.dsp.window.float({ action = "set", window = "address:' + address + '" })'])
-              return
+            var rect = JSON.parse(root.clip(text, 2048))
+            if (rect.w > 0 && rect.w <= 65536 && rect.h > 0 && rect.h <= 65536) {
+              root.cardW = rect.w
+              root.cardH = rect.h
             }
           } catch (e) {}
+        }
+      }
+      onExited: function(code) {
+        if (code === 0 && popupWin.visible) {
+          popupPlaceRetry.stop()
+          popupWin.placing = false
+          popupSizeSave.restart()
         }
       }
     }
@@ -1661,6 +1623,7 @@ BarWidget {
 
     Rectangle {
       id: card
+      opacity: popupWin.placing ? 0 : 1
       width: popupWin.width
       height: popupWin.height
       // The compositor moves the toplevel; the card fills its content area.
