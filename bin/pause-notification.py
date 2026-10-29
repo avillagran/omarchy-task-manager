@@ -7,6 +7,9 @@ fall back to a themed icon and the explicit paused summary.
 import configparser
 import os
 import resource
+import select
+import signal
+import time
 import stat
 from pathlib import Path
 import re
@@ -26,9 +29,36 @@ def limit_image():
 
 
 def run(args, timeout=2):
-    return subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                          stderr=subprocess.DEVNULL, timeout=timeout, check=True,
-                          preexec_fn=limit_image if args[0] == "magick" else None).stdout
+    child = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, start_new_session=True,
+                             preexec_fn=limit_image if args[0] == "magick" else None)
+    deadline = time.monotonic() + timeout
+    output = bytearray()
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([child.stdout], [], [], left)[0]:
+                raise subprocess.TimeoutExpired(args, timeout)
+            chunk = os.read(child.stdout.fileno(), min(4096, 4097 - len(output)))
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > 4096:
+                raise OSError("notification helper output exceeds limit")
+        child.wait(timeout=max(.001, deadline - time.monotonic()))
+        if child.returncode:
+            raise subprocess.CalledProcessError(child.returncode, args)
+        return bytes(output)
+    except BaseException:
+        # Include ImageMagick delegates and any descendant holding a pipe.
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.wait()
+        raise
+    finally:
+        child.stdout.close()
 
 
 def desktop_text(path):

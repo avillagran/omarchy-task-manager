@@ -106,6 +106,30 @@ class Notification(unittest.TestCase):
             path.unlink();path.symlink_to(Path(directory)/'elsewhere')
             with self.assertRaises(OSError):n.desktop_text(path)
 
+    def test_external_output_is_capped_before_collection(self):
+        import sys
+        with self.assertRaises(OSError):
+            n.run([sys.executable,'-c','print("x"*1000000)'])
+
+    def test_timeout_kills_delegate_process_group(self):
+        import os
+        import sys
+        import signal
+        with tempfile.TemporaryDirectory() as directory:
+            pidfile=Path(directory)/'child'
+            code='import subprocess,sys,time; from pathlib import Path; p=subprocess.Popen([sys.executable,"-c","import time; time.sleep(120)"]); Path(sys.argv[1]).write_text(str(p.pid)); time.sleep(120)'
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    n.run([sys.executable,'-c',code,str(pidfile)], timeout=.3)
+                if pidfile.exists():
+                    pid=int(pidfile.read_text()); status=Path('/proc')/str(pid)/'stat'
+                    if status.exists():
+                        self.assertEqual(status.read_text().split()[2],'Z')
+            finally:
+                if pidfile.exists():
+                    try:os.kill(int(pidfile.read_text()),signal.SIGKILL)
+                    except ProcessLookupError:pass
+
     def test_partial_resume_retains_notice_until_final_stop_clears(self):
         paused = tm.AutoPause('app', 100, ([], []), ([(12, 1)], []))
         paused.notification = unittest.mock.Mock()
