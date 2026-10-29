@@ -123,8 +123,12 @@ class Notification(unittest.TestCase):
                     n.run([sys.executable,'-c',code,str(pidfile)], timeout=.3)
                 if pidfile.exists():
                     pid=int(pidfile.read_text()); status=Path('/proc')/str(pid)/'stat'
-                    if status.exists():
-                        self.assertEqual(status.read_text().split()[2],'Z')
+                    try:
+                        state = status.read_text().split()[2]
+                    except FileNotFoundError:
+                        pass  # init reaped the killed delegate between reads
+                    else:
+                        self.assertEqual(state,'Z')
             finally:
                 if pidfile.exists():
                     try:os.kill(int(pidfile.read_text()),signal.SIGKILL)
